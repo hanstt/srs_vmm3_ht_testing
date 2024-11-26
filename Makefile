@@ -15,8 +15,10 @@ $(FUSER): fuser.o
 $(GEN): gen.o
 	$(CC) $(LDFLAGS) -o $@ $<
 
-$(TEST): test.o $(UNGRAY_TABLE)
+$(TEST): test.o
 	$(CC) $(LDFLAGS) -o $@ $<
+
+test.o: $(UNGRAY_TABLE)
 
 $(UNGRAY_TABLE): $(UNGRAY)
 	./$< > $@.tmp

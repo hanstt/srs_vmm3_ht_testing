@@ -25,6 +25,10 @@
 #define SUBMOD(l, r, range) \
     ((((int64_t)(l - r) + (range) + (range)/2) & ((range) - 1)) - (range)/2)
 
+#define PF_TS(ts) \
+	(uint32_t)((ts) >> 32), \
+	(uint32_t)((ts) & 0xffffffff)
+
 /* Circular buffer code. */
 
 /* wr == rd -> empty, wr+1 == rd -> full. */
@@ -233,10 +237,8 @@ process_ht(unsigned a_vmm_i, unsigned a_ch_i, uint64_t a_ts_curr)
 		vmm->ht_build.vmm_ts = a_ts_curr;
 		if (0)
 			printf("HT1 = %08x%08x  TS1 = %08x%08x\n",
-			    vmm->ht_build.ht >> 32,
-			    vmm->ht_build.ht & 0xffffffff,
-			    vmm->ht_build.vmm_ts >> 32,
-			    vmm->ht_build.vmm_ts & 0xffffffff);
+			    PF_TS(vmm->ht_build.ht),
+			    PF_TS(vmm->ht_build.vmm_ts));
 	}
 	if (32 == vmm->ht_build.bits) {
 		/* Full Heimtime decoded! */
@@ -254,10 +256,8 @@ process_ht(unsigned a_vmm_i, unsigned a_ch_i, uint64_t a_ts_curr)
 		if (0)
 			printf("Lock %u HT1 = %08x%08x  TS1 = %08x%08x\n",
 			    a_vmm_i,
-			    vmm->ht_build.ht >> 32,
-			    vmm->ht_build.ht & 0xffffffff,
-			    vmm->ht_build.vmm_ts >> 32,
-			    vmm->ht_build.vmm_ts & 0xffffffff);
+			    PF_TS(vmm->ht_build.ht),
+			    PF_TS(vmm->ht_build.vmm_ts));
 		/*
 		 * Don't complain about lost HT's, will happen when no MS
 		 * coming in. Not great, not terrible.
@@ -296,9 +296,7 @@ process_hit(uint32_t a_u32, uint16_t a_u16)
 	vmm = vmm_get(vmm_i);
 	ts = vmm->ts_marker | ofs << 12 | bcid;
 	if (0)
-		printf("%08x%08x\n",
-		    ts >> 32,
-		    ts & 0xffffffff);
+		printf("%08x%08x\n", PF_TS(ts));
 
 	if (is_ht_ch(vmm_i, ch_i)) {
 		/* Stop! Heimtime! */
@@ -335,8 +333,7 @@ process_marker(uint32_t a_u32, uint16_t a_u16)
 		printf("VMM = %2u  "
 		    "TS = 0x%08x%08x\n",
 		    vmm_i,
-		    ts >> 32,
-		    ts & 0xffffffff);
+		    PF_TS(ts));
 
 	vmm = vmm_get(vmm_i);
 	/* TODO: Report bug? */
@@ -369,9 +366,10 @@ clean_hits()
 				roi = (ROI_RIGHT_US - ROI_LEFT_US) * 1e3 /
 				    T2NS * 2;
 				if (SUBMOD(hit_last->vmm_ts, hit->vmm_ts,
-				    1 << 30) > roi) {
-					CIRC_DROP(vmm->hit);
+				    1 << 30) < roi) {
+					break;
 				}
+				CIRC_DROP(vmm->hit);
 			}
 		} else {
 			/* Drop hits until 1st MS left edge. */
@@ -445,9 +443,8 @@ if(0)			fprintf(stderr, "1st MS before 1st HT, dropping!\n");
 		    / (ht1->vmm_ts - ht0->vmm_ts)
 		    + ht0->ht;
 		if (0) printf("%u: MS HT = %08x%08x\n",
-		    i,
-		    ms->ht >> 32,
-		    ms->ht & 0xffffffff);
+		    (unsigned)i,
+		    PF_TS(ms->ht));
 	}
 }
 
@@ -475,7 +472,7 @@ ms_coinc(void)
 			ht = ms->ht;
 			continue;
 		}
-		if (fabs(ms->ht - ht) > MS_WINDOW_NS) {
+		if (fabs((double)(int64_t)(ms->ht - ht)) > MS_WINDOW_NS) {
 			/* MS's are not coincident, cannot emit. */
 			return 0;
 		}
@@ -549,11 +546,7 @@ emit()
 	ts = ms_earliest->vmm_ts;
 
 	if (0)
-		printf("0x%08x%08x 0x%08x%08x\n",
-		    ht >> 32,
-		    ht & 0xffffffff,
-		    ts >> 32,
-		    ts & 0xffffffff);
+		printf("0x%08x%08x 0x%08x%08x\n", PF_TS(ht), PF_TS(ts));
 
 	/* Emit coincident MS's. */
 	for (i = 0; i < g_vmm_num; ++i) {
@@ -567,7 +560,7 @@ emit()
 		if (0 == ms->ht) {
 			continue;
 		}
-		if (fabs(ms->ht - ht) < MS_WINDOW_NS) {
+		if (fabs((double)(int64_t)(ms->ht - ht)) < MS_WINDOW_NS) {
 			uint64_t roi_left, roi_right;
 
 			roi_left = ms->vmm_ts + ROI_LEFT;
@@ -589,20 +582,17 @@ emit()
 				} else {
 					/* Emit hit! */
 					if (0) printf(" vmm=%u ch=%u ts=%08x%08x\n",
-					    i,
+					    (unsigned)i,
 					    hit->ch,
-					    hit->vmm_ts >> 32,
-					    hit->vmm_ts & 0xffffffff);
+					    PF_TS(hit->vmm_ts));
 					CIRC_DROP(vmm->hit);
 				}
 			}
 			CIRC_DROP(vmm->ms);
 			if (0) printf(" %u 0x%08x%08x 0x%08x%08x\n",
-			    i,
-			    ms->ht >> 32,
-			    ms->ht & 0xffffffff,
-			    ms->vmm_ts >> 32,
-			    ms->vmm_ts & 0xffffffff);
+			    (unsigned)i,
+			    PF_TS(ms->ht),
+			    PF_TS(ms->vmm_ts));
 		}
 	}
 
@@ -659,23 +649,47 @@ roi()
 int
 main()
 {
+	struct sockaddr_in addr;
 	int fd;
 	size_t buf_ofs = 16;
 	uint32_t frame_prev = 0xffffffff;
-unsigned ii;
 
+/*
 	fd = open("output_2vmm_200kPoisson.bin", O_RDONLY);
 	if (-1 == fd) {
 		err(EXIT_FAILURE, "open");
 	}
+*/
+	{
+		fd = socket(AF_INET, SOCK_DGRAM, 0);
+		if (-1 == fd) {
+			err(EXIT_FAILURE, "socket");
+		}
+		memset(&addr, 0, sizeof addr);
+		addr.sin_family = AF_INET;
+		addr.sin_addr.s_addr = INADDR_ANY;
+		addr.sin_port = htons(9000);
+		if (bind(fd, (void *)&addr, sizeof addr) < 0) {
+			err(EXIT_FAILURE, "bind");
+		}
+	}
 
-	for (ii = 0; ii < 1e9; ++ii) {
+	for (;;) {
 		/* 16 potential data from last read + new buf. */
 		uint8_t buf[16 + 8192];
 		ssize_t bytes, end, i, len;
 
 		/* Read block. */
+/*
 		bytes = read(fd, buf + 16, sizeof buf - 16);
+*/
+		{
+			socklen_t socklen;
+
+			socklen = sizeof addr;
+			bytes = recvfrom(fd, buf + 16, sizeof buf - 16,
+			    MSG_WAITALL, (void *)&addr, &socklen);
+		}
 		if (-1 == bytes) {
 			err(EXIT_FAILURE, "read");
 		} else if (0 == bytes) {
