@@ -93,7 +93,7 @@ struct Vmm {
 	struct {
 		enum	HTState state;
 		unsigned	bits;
-		uint64_t	mask;
+		uint32_t	mask;
 		uint64_t	ht;
 		uint64_t	vmm_ts_prev;
 		uint64_t	vmm_ts;
@@ -109,6 +109,15 @@ struct Vmm {
 
 static struct Vmm *g_vmm_arr;
 static size_t g_vmm_num;
+
+double
+time_get(void)
+{
+	struct timespec tp;
+
+	clock_gettime(CLOCK_MONOTONIC, &tp);
+	return tp.tv_sec + 1e-9 * tp.tv_nsec;
+}
 
 uint32_t
 ungray(uint32_t a_u)
@@ -183,25 +192,30 @@ process_ht(unsigned a_vmm_i, unsigned a_ch_i, uint64_t a_ts_curr)
 #define HT_ZERO 0.16384
 #define HT_ONE 0.65536
 #define APPROX(ms) fabs(dt - 1e6 * (ms)) < 1e4
-#define HT_LOST do { \
-		fprintf(stderr, "Heimtime sync lost!\n"); \
-		vmm->ht_build.bits = 0; \
+#define HT_LOST(msg) do { \
+		fprintf(stderr, "vmm=%u: Heimtime sync lost, expected " msg \
+		    "!\n", a_vmm_i); \
+		vmm->ht_build.state = HT_STATE_PERIODIC; \
 	} while (0)
 	switch (vmm->ht_build.state) {
 	case HT_STATE_PERIODIC:
 		if (APPROX(HT_PERIOD)) {
 			do_incr = 1;
+			vmm->ht_build.mask = 0;
+			vmm->ht_build.bits = 0;
 		} else if (APPROX(HT_ZERO)) {
 			vmm->ht_build.state = HT_STATE_00;
 		} else if (APPROX(HT_ONE)) {
 			vmm->ht_build.state = HT_STATE_10;
+		} else {
+			HT_LOST("periodic");
 		}
 		break;
 	case HT_STATE_00:
 		if (APPROX(HT_ZERO)) {
 			vmm->ht_build.state = HT_STATE_01;
 		} else {
-			HT_LOST;
+			HT_LOST("2nd zero");
 		}
 		break;
 	case HT_STATE_01:
@@ -210,14 +224,14 @@ process_ht(unsigned a_vmm_i, unsigned a_ch_i, uint64_t a_ts_curr)
 			vmm->ht_build.state = HT_STATE_PERIODIC;
 			do_incr = 1;
 		} else {
-			HT_LOST;
+			HT_LOST("period after 2nd zero");
 		}
 		break;
 	case HT_STATE_10:
 		if (APPROX(HT_ONE)) {
 			vmm->ht_build.state = HT_STATE_11;
 		} else {
-			HT_LOST;
+			HT_LOST("2nd one");
 		}
 		break;
 	case HT_STATE_11:
@@ -227,7 +241,7 @@ process_ht(unsigned a_vmm_i, unsigned a_ch_i, uint64_t a_ts_curr)
 			vmm->ht_build.state = HT_STATE_PERIODIC;
 			do_incr = 1;
 		} else {
-			HT_LOST;
+			HT_LOST("period after 2nd one");
 		}
 		break;
 	}
@@ -236,17 +250,22 @@ process_ht(unsigned a_vmm_i, unsigned a_ch_i, uint64_t a_ts_curr)
 		vmm->ht_build.ht += 1 << 19;
 		vmm->ht_build.vmm_ts = a_ts_curr;
 		if (0)
-			printf("HT1 = %08x%08x  TS1 = %08x%08x\n",
-			    PF_TS(vmm->ht_build.ht),
-			    PF_TS(vmm->ht_build.vmm_ts));
+			fprintf(stderr, "vmm=%u: TS1 = %08x%08x  HT1 = %08x%08x\n",
+			    a_vmm_i,
+			    PF_TS(vmm->ht_build.vmm_ts),
+			    PF_TS(vmm->ht_build.ht));
 	}
 	if (32 == vmm->ht_build.bits) {
 		/* Full Heimtime decoded! */
 		struct TsPair *pair;
-		uint64_t ht = vmm->ht_build.mask << 24;
+		uint64_t ht = (uint64_t)vmm->ht_build.mask << 24;
 
 		if (vmm->ht_build.ht > 0 && vmm->ht_build.ht != ht) {
-			fprintf(stderr, "Heimtime pulses were lost!\n");
+			fprintf(stderr, "vmm=%u: Heimtime got=%08x%08x but "
+			    "expected=%08x%08x!\n",
+			    a_vmm_i,
+			    PF_TS(ht),
+			    PF_TS(vmm->ht_build.ht));
 		}
 		vmm->ht_build.ht = ht;
 		vmm->ht_build.vmm_ts = a_ts_curr;
@@ -254,10 +273,10 @@ process_ht(unsigned a_vmm_i, unsigned a_ch_i, uint64_t a_ts_curr)
 		vmm->ht_build.mask = 0;
 		vmm->ht_build.bits = 0;
 		if (0)
-			printf("Lock %u HT1 = %08x%08x  TS1 = %08x%08x\n",
+			fprintf(stderr, "vmm=%u: Lock TS1 = %08x%08x  HT1 = %08x%08x\n",
 			    a_vmm_i,
-			    PF_TS(vmm->ht_build.ht),
-			    PF_TS(vmm->ht_build.vmm_ts));
+			    PF_TS(vmm->ht_build.vmm_ts),
+			    PF_TS(vmm->ht_build.ht));
 		/*
 		 * Don't complain about lost HT's, will happen when no MS
 		 * coming in. Not great, not terrible.
@@ -396,10 +415,11 @@ clean_hits()
 }
 
 /* Converts 1st MS VMM times to Heimtime. */
-void
+int
 time_ms()
 {
 	size_t i;
+	int ok = 1;
 
 	for (i = 0; i < g_vmm_num; ++i) {
 		struct Vmm *vmm = &g_vmm_arr[i];
@@ -409,6 +429,7 @@ time_ms()
 
 find_ms:
 		if (CIRC_GETNUM(vmm->ms) == 0) {
+			ok = 0;
 			continue;
 		}
 		CIRC_PEEK(ms, vmm->ms, 0);
@@ -420,6 +441,7 @@ find_ms:
 find_ht_span:
 		if (CIRC_GETNUM(vmm->ht) < 2) {
 			/* We need at least 2 HT's to interpolate. */
+			ok = 0;
 			continue;
 		}
 		CIRC_PEEK(ht0, vmm->ht, 0);
@@ -446,6 +468,7 @@ if(0)			fprintf(stderr, "1st MS before 1st HT, dropping!\n");
 		    (unsigned)i,
 		    PF_TS(ms->ht));
 	}
+	return ok;
 }
 
 int
@@ -546,7 +569,7 @@ emit()
 	ts = ms_earliest->vmm_ts;
 
 	if (0)
-		printf("0x%08x%08x 0x%08x%08x\n", PF_TS(ht), PF_TS(ts));
+		printf("0x%08x%08x 0x%08x%08x\n", PF_TS(ts), PF_TS(ht));
 
 	/* Emit coincident MS's. */
 	for (i = 0; i < g_vmm_num; ++i) {
@@ -591,24 +614,22 @@ emit()
 			CIRC_DROP(vmm->ms);
 			if (0) printf(" %u 0x%08x%08x 0x%08x%08x\n",
 			    (unsigned)i,
-			    PF_TS(ms->ht),
-			    PF_TS(ms->vmm_ts));
+			    PF_TS(ms->vmm_ts),
+			    PF_TS(ms->ht));
 		}
 	}
 
 	{
 		static unsigned msn = 0;
 		static double t_last = -1.0;
-		struct timespec tp;
 		double t;
 
 		++msn;
-		clock_gettime(CLOCK_MONOTONIC, &tp);
-		t = tp.tv_sec + 1e-9 * tp.tv_nsec;
+		t = time_get();
 		if (t_last < 0.0) {
 			t_last = t;
 		} else if (t_last + 0.1 < t) {
-			printf("MS = %u  /s = %f\n",
+			if (0) printf("MS = %u  /s = %f\n",
 			    msn, msn / (t - t_last));
 			msn = 0;
 			t_last = t;
@@ -626,8 +647,10 @@ roi()
 		/* Clean hits. */
 		clean_hits();
 
-		/* Transform 1st MS times to HT. */
-		time_ms();
+		/* Transform 1st MS times to HT, and drop old HT+MS. */
+		if (!time_ms()) {
+			break;
+		}
 
 		/* On a good day we have coinc MS's in all VMM's. */
 		if (!ms_coinc()) {
@@ -636,6 +659,27 @@ roi()
 			 * - Too little data to say if any VMM missed MS.
 			 * - Any VMM missed MS, emit the others.
 			 */
+if (0) {
+	size_t i;
+
+	for (i = 0; i < g_vmm_num; ++i) {
+		struct Vmm *vmm = &g_vmm_arr[i];
+		struct TsPair const *ms;
+
+		if (CIRC_GETNUM(vmm->ms) > 0) {
+			CIRC_PEEK(ms, vmm->ms, 0);
+			printf("%u %08x%08x %08x%08x",
+					(unsigned)i,
+					PF_TS(ms->vmm_ts), PF_TS(ms->ht));
+		}
+		if (CIRC_GETNUM(vmm->ms) > 1) {
+			CIRC_PEEK(ms, vmm->ms, 1);
+			printf(" - %08x%08x %08x%08x",
+					PF_TS(ms->vmm_ts), PF_TS(ms->ht));
+		}
+		puts("");
+	}
+}
 			if (!ms_timeout()) {
 				/* Let's get more data. */
 				break;
@@ -646,6 +690,35 @@ roi()
 	}
 }
 
+void
+mon(void)
+{
+	static double t_prev = -1.0;
+	double t = time_get();
+	size_t i;
+
+	if (t_prev < 0.0) {
+		t_prev = t;
+	}
+	if (t_prev + 1 > t) {
+		return;
+	}
+	t_prev = t;
+
+	for (i = 0; i < g_vmm_num; ++i) {
+		struct Vmm *vmm = &g_vmm_arr[i];
+
+		printf("%u: ht=%u ms=%u hit=%u\n",
+			(unsigned)i,
+			(unsigned)((vmm->ht.wr_i - vmm->ht.rd_i) %
+			LENGTH(vmm->ht.arr)),
+			(unsigned)((vmm->ms.wr_i - vmm->ms.rd_i) %
+			LENGTH(vmm->ms.arr)),
+			(unsigned)((vmm->hit.wr_i - vmm->hit.rd_i) %
+			LENGTH(vmm->hit.arr)));
+	}
+}
+
 int
 main()
 {
@@ -653,13 +726,16 @@ main()
 	int fd;
 	size_t buf_ofs = 16;
 	uint32_t frame_prev = 0xffffffff;
+	int has_header = 0;
 
-/*
-	fd = open("output_2vmm_200kPoisson.bin", O_RDONLY);
+#define FROM_FILE 1
+#if FROM_FILE
+	fd = open("/home/hydra-tpc/new/v010/srs-install/bin/tjohej.bin",
+	    O_RDONLY);
 	if (-1 == fd) {
 		err(EXIT_FAILURE, "open");
 	}
-*/
+#else
 	{
 		fd = socket(AF_INET, SOCK_DGRAM, 0);
 		if (-1 == fd) {
@@ -673,16 +749,18 @@ main()
 			err(EXIT_FAILURE, "bind");
 		}
 	}
+#endif
 
 	for (;;) {
 		/* 16 potential data from last read + new buf. */
-		uint8_t buf[16 + 8192];
+#define BUF_SIZE (1 << 16)
+		uint8_t buf[16 + BUF_SIZE];
 		ssize_t bytes, end, i, len;
 
 		/* Read block. */
-/*
+#if FROM_FILE
 		bytes = read(fd, buf + 16, sizeof buf - 16);
-*/
+#else
 		{
 			socklen_t socklen;
 
@@ -690,6 +768,7 @@ main()
 			bytes = recvfrom(fd, buf + 16, sizeof buf - 16,
 			    MSG_WAITALL, (void *)&addr, &socklen);
 		}
+#endif
 		if (-1 == bytes) {
 			err(EXIT_FAILURE, "read");
 		} else if (0 == bytes) {
@@ -715,14 +794,15 @@ main()
 				frame = BUF_R32(0);
 				if (0xffffffff != frame_prev &&
 				    frame_prev + 1 != frame) {
-					printf("Frame counter mismatch "
-					    "(0x%08x -> 0x%08x)!\n",
+					fprintf(stderr, "Frame counter "
+					    "mismatch (0x%08x -> 0x%08x)!\n",
 					    frame_prev, frame);
 				}
 				frame_prev = frame;
 
 				i += 4 * sizeof(uint32_t);
-			} else {
+				has_header = 1;
+			} else if (has_header) {
 				uint32_t u32;
 				uint16_t u16;
 				unsigned is_hit;
@@ -741,6 +821,8 @@ main()
 				}
 			}
 		}
+
+		mon();
 
 		/* Look for ROI's. */
 		roi();
