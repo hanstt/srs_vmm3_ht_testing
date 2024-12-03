@@ -19,6 +19,11 @@
     (uint32_t)((ts) >> 32), \
     (uint32_t)((ts) & 0xffffffff)
 
+enum ParseState {
+  PARSE_HEADER = 0,
+  PARSE_HITS
+};
+
 struct Vmm {
   uint64_t	ts_marker;
 };
@@ -149,9 +154,15 @@ process_marker(uint32_t a_u32, uint16_t a_u16)
 int
 main(int argc, char **argv)
 {
+  /* 16 potential data from last read + new buf. */
+#define BUF_SIZE (1 << 16)
+  uint8_t buf[16 + BUF_SIZE];
+  size_t buf_ofs = 0;
+  enum ParseState parse_state = PARSE_HEADER;
+  unsigned hit_ctr;
+
   char *opath;
   int fd;
-  size_t buf_ofs = 16;
   uint32_t frame_prev = 0xffffffff;
   int has_header = 0;
 
@@ -189,13 +200,10 @@ main(int argc, char **argv)
   tree->Branch("hit_ts",     &g_hit_ts,     "hit_ts[hit]/l");
 
   for (;;) {
-    /* 16 potential data from last read + new buf. */
-#define BUF_SIZE (1 << 16)
-    uint8_t buf[16 + BUF_SIZE];
-    ssize_t bytes, end, i, len;
+    ssize_t bytes, end, i;
 
     /* Read block. */
-    bytes = read(fd, buf + 16, sizeof buf - 16);
+    bytes = read(fd, buf + buf_ofs, BUF_SIZE);
     if (-1 == bytes) {
       err(EXIT_FAILURE, "read");
     } else if (0 == bytes) {
@@ -206,56 +214,78 @@ main(int argc, char **argv)
     tot += bytes;
 
     /* Parse block. */
-#define BUF_R32(ofs) ntohl(*(uint32_t const *)(buf + i + ofs))
-#define BUF_R16(ofs) ntohs(*(uint16_t const *)(buf + i + ofs))
-    end = 16 + bytes;
-    for (i = buf_ofs; i < end;) {
-      uint32_t id;
-
-      if (i + 4 * sizeof(uint32_t) > end) {
+#define BUF_R32(ofs) ntohl(*(uint32_t const *)(buf + i + (ofs)))
+#define BUF_R16(ofs) ntohs(*(uint16_t const *)(buf + i + (ofs)))
+    end = buf_ofs + bytes;
+    for (i = 0; i < end;) {
+      if (i + 6 * sizeof(uint32_t) > end) {
         break;
       }
 
       g_marker = 0;
       g_hit = 0;
 
-      id = BUF_R32(4);
-      if ((0xffffff00 & id) == 0x564d3300) {
-        uint32_t frame;
+      switch (parse_state) {
+        case PARSE_HEADER:
+          {
+            uint32_t id;
 
-        /* Looks like a header. */
-        frame = BUF_R32(0);
-        if (0xffffffff != frame_prev &&
-            frame_prev + 1 != frame) {
-          fprintf(stderr, "Frame counter "
-              "mismatch (0x%08x -> 0x%08x)!\n",
-              frame_prev, frame);
-        }
-        frame_prev = frame;
+            id = BUF_R32(3 * sizeof(uint32_t));
+            if ((0xffffff00 & id) == 0x564d3300) {
+              uint32_t frame;
 
-        i += 4 * sizeof(uint32_t);
-        has_header = 1;
-      } else if (has_header) {
-        uint32_t u32;
-        uint16_t u16;
-        unsigned is_hit;
+              /* Looks like a header. */
+              frame = BUF_R32(2 * sizeof(uint32_t));
+              if (0xffffffff != frame_prev &&
+                  frame_prev + 1 != frame) {
+                fprintf(stderr, "Frame counter "
+                    "mismatch (0x%08x -> 0x%08x)!\n",
+                    frame_prev, frame);
+              }
+              frame_prev = frame;
 
-        /* Hit or marker. */
-        u32 = BUF_R32(0);
-        i += sizeof(uint32_t);
-        u16 = BUF_R16(0);
-        i += sizeof(uint16_t);
+              hit_ctr = BUF_R32(0) - 4 * sizeof(uint32_t);
+              if (hit_ctr % 6 == 0) {
+                hit_ctr /= 6;
+                parse_state = PARSE_HITS;
+              } else {
+                fprintf(stderr, "Parcel size (%u) not divisible by 6!\n",
+                    hit_ctr);
+              }
 
-        is_hit = 0x8000 & u16;
-        if (is_hit) {
-          process_hit(u32, u16);
-          ++tot_hit;
-        } else {
-          process_marker(u32, u16);
-          ++tot_marker;
-        }
-      } else {
-        i += sizeof(uint32_t);
+              i += 6 * sizeof(uint32_t);
+            } else {
+              i += sizeof(uint32_t);
+            }
+          }
+          break;
+        case PARSE_HITS:
+          {
+            uint32_t u32;
+            uint16_t u16;
+            unsigned is_hit;
+
+            /* Hit or marker. */
+            u32 = BUF_R32(0);
+            i += sizeof(uint32_t);
+            u16 = BUF_R16(0);
+            i += sizeof(uint16_t);
+
+            is_hit = 0x8000 & u16;
+            if (is_hit) {
+              process_hit(u32, u16);
+              ++tot_hit;
+            } else {
+              process_marker(u32, u16);
+              ++tot_marker;
+            }
+
+            --hit_ctr;
+            if (0 == hit_ctr) {
+              parse_state = PARSE_HEADER;
+            }
+          }
+          break;
       }
       if (g_marker || g_hit) {
         tree->Fill();
@@ -279,9 +309,8 @@ main(int argc, char **argv)
     }
 
     /* Move any remaining data to the pre-buf space. */
-    len = end - i;
-    buf_ofs = 16 - len;
-    memcpy(buf + buf_ofs, buf + i, len);
+    buf_ofs = end - i;
+    memcpy(buf, buf + i, buf_ofs);
   }
   printf("\nTot=%.1f MB\n", 1e-6 * tot);
   tree->Write();
