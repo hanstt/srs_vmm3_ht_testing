@@ -19,11 +19,6 @@
     (uint32_t)((ts) >> 32), \
     (uint32_t)((ts) & 0xffffffff)
 
-enum ParseState {
-  PARSE_HEADER = 0,
-  PARSE_HITS
-};
-
 struct Vmm {
   uint64_t	ts_marker;
 };
@@ -158,13 +153,11 @@ main(int argc, char **argv)
 #define BUF_SIZE (1 << 16)
   uint8_t buf[16 + BUF_SIZE];
   size_t buf_ofs = 0;
-  enum ParseState parse_state = PARSE_HEADER;
-  unsigned hit_ctr;
+  int has_header = 0;
 
   char *opath;
   int fd;
   uint32_t frame_prev = 0xffffffff;
-  int has_header = 0;
 
   unsigned tot_byte = 0;
   unsigned tot_marker = 0;
@@ -218,6 +211,10 @@ main(int argc, char **argv)
 #define BUF_R16(ofs) ntohs(*(uint16_t const *)(buf + i + (ofs)))
     end = buf_ofs + bytes;
     for (i = 0; i < end;) {
+      uint32_t id;
+      int is_header;
+      int has_size;
+
       if (i + 6 * sizeof(uint32_t) > end) {
         break;
       }
@@ -225,70 +222,58 @@ main(int argc, char **argv)
       g_marker = 0;
       g_hit = 0;
 
-      switch (parse_state) {
-        case PARSE_HEADER:
-          {
-            uint32_t id;
-
-            id = BUF_R32(3 * sizeof(uint32_t));
-            if ((0xffffff00 & id) == 0x564d3300) {
-              uint32_t frame;
-
-              /* Looks like a header. */
-              frame = BUF_R32(2 * sizeof(uint32_t));
-              if (0xffffffff != frame_prev &&
-                  frame_prev + 1 != frame) {
-                fprintf(stderr, "Frame counter "
-                    "mismatch (0x%08x -> 0x%08x)!\n",
-                    frame_prev, frame);
-              }
-              frame_prev = frame;
-
-              hit_ctr = BUF_R32(0) - 4 * sizeof(uint32_t);
-              if (hit_ctr % 6 == 0) {
-                hit_ctr /= 6;
-                parse_state = PARSE_HITS;
-              } else {
-                fprintf(stderr, "Parcel size (%u) not divisible by 6!\n",
-                    hit_ctr);
-              }
-
-              i += 6 * sizeof(uint32_t);
-            } else {
-              i += sizeof(uint32_t);
-            }
-          }
-          break;
-        case PARSE_HITS:
-          {
-            uint32_t u32;
-            uint16_t u16;
-            unsigned is_hit;
-
-            /* Hit or marker. */
-            u32 = BUF_R32(0);
-            i += sizeof(uint32_t);
-            u16 = BUF_R16(0);
-            i += sizeof(uint16_t);
-
-            is_hit = 0x8000 & u16;
-            if (is_hit) {
-              process_hit(u32, u16);
-              ++tot_hit;
-            } else {
-              process_marker(u32, u16);
-              ++tot_marker;
-            }
-
-            --hit_ctr;
-            if (0 == hit_ctr) {
-              parse_state = PARSE_HEADER;
-            }
-          }
-          break;
+      is_header = 0;
+      id = BUF_R32(1 * sizeof(uint32_t));
+      is_header = (0xffffff00 & id) == 0x564d3300;
+      has_size = 0;
+      if (!is_header) {
+        uint32_t s1, s2;
+        s1 = BUF_R32(0 * sizeof(uint32_t));
+        s2 = BUF_R32(1 * sizeof(uint32_t));
+        id = BUF_R32(3 * sizeof(uint32_t));
+        is_header = s1 == s2 && (0xffffff00 & id) == 0x564d3300;
+        has_size = 1;
       }
-      if (g_marker || g_hit) {
-        tree->Fill();
+      if (is_header) {
+        uint32_t frame;
+
+        /* Looks like a header. */
+        frame = BUF_R32((has_size * 2) * sizeof(uint32_t));
+        if (0xffffffff != frame_prev &&
+            frame_prev + 1 != frame) {
+          fprintf(stderr, "Frame counter "
+              "mismatch (0x%08x -> 0x%08x)!\n",
+              frame_prev, frame);
+        }
+        frame_prev = frame;
+
+        has_header = 1;
+
+        i += (has_size * 2 + 4) * sizeof(uint32_t);
+      } else if (has_header) {
+        uint32_t u32;
+        uint16_t u16;
+        unsigned is_hit;
+
+        /* Hit or marker. */
+        u32 = BUF_R32(0);
+        i += sizeof(uint32_t);
+        u16 = BUF_R16(0);
+        i += sizeof(uint16_t);
+
+        is_hit = 0x8000 & u16;
+        if (is_hit) {
+          process_hit(u32, u16);
+          ++tot_hit;
+        } else {
+          process_marker(u32, u16);
+          ++tot_marker;
+        }
+        if (g_marker || g_hit) {
+          tree->Fill();
+        }
+      } else {
+        i += sizeof(uint32_t);
       }
     }
 
