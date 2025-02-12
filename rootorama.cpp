@@ -227,18 +227,15 @@ main(int argc, char **argv)
       is_header = (0xffffff00 & id) == 0x564d3300;
       has_size = 0;
       if (!is_header) {
-        uint32_t s1, s2;
-        s1 = BUF_R32(0 * sizeof(uint32_t));
-        s2 = BUF_R32(1 * sizeof(uint32_t));
-        id = BUF_R32(3 * sizeof(uint32_t));
-        is_header = s1 == s2 && (0xffffff00 & id) == 0x564d3300;
+        id = BUF_R32(2 * sizeof(uint32_t));
+        is_header = (0xffffff00 & id) == 0x564d3300;
         has_size = 1;
       }
       if (is_header) {
         uint32_t frame;
 
         /* Looks like a header. */
-        frame = BUF_R32((has_size * 2) * sizeof(uint32_t));
+        frame = BUF_R32(has_size * sizeof(uint32_t));
         if (0xffffffff != frame_prev &&
             frame_prev + 1 != frame) {
           fprintf(stderr, "Frame counter "
@@ -249,7 +246,7 @@ main(int argc, char **argv)
 
         has_header = 1;
 
-        i += (has_size * 2 + 4) * sizeof(uint32_t);
+        i += (has_size + 4) * sizeof(uint32_t);
       } else if (has_header) {
         uint32_t u32;
         uint16_t u16;
