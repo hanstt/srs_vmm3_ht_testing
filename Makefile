@@ -5,7 +5,7 @@ ROOTORAMA:=rootorama
 UNGRAY:=ungray
 UNGRAY_TABLE:=ungray_table.h
 
-CFLAGS:=-ggdb -Werror -Wshadow -O3
+CFLAGS:=-ggdb -Werror -O3
 ROOT_CFLAGS:=$(shell root-config --cflags)
 LDFLAGS:=
 ROOT_LIBS:=$(shell root-config --libs)
