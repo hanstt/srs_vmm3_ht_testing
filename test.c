@@ -11,15 +11,15 @@
 #include <unistd.h>
 #include "ungray_table.h"
 
-#define T2NS (5.24288 / 0.233045)
+#define TS2NS 22.5 /* (5.24288 / 0.233045) */
 
 #define ROI_LEFT_US -1.0
 #define ROI_RIGHT_US +1.0
 #define MS_WINDOW_NS 100.0
 #define MS_TIMEOUT_S 3.0
 
-#define ROI_LEFT (1e3 * ROI_LEFT_US / T2NS)
-#define ROI_RIGHT (1e3 * ROI_RIGHT_US / T2NS)
+#define ROI_LEFT (1e3 * ROI_LEFT_US / TS2NS)
+#define ROI_RIGHT (1e3 * ROI_RIGHT_US / TS2NS)
 
 #define LENGTH(x) (sizeof x / sizeof *x)
 #define SUBMOD(l, r, range) \
@@ -62,8 +62,7 @@
 	circ.wr_i = wr_n; \
 	if (is_full) { \
 		if (do_complain_about_full) { \
-			fprintf(stderr, \
-			    "Too many " name "s, dropping data!\n"); \
+			printf("Too many " name "s, dropping data!\n"); \
 		} \
 		circ.rd_i = CIRC_STEP(circ, rd_i, 1); \
 	} \
@@ -73,6 +72,7 @@
 	idx = (idx + 1) & (LENGTH(circ.arr) - 1))
 
 enum HTState {
+	HT_STATE_NONE,
 	HT_STATE_PERIODIC,
 	HT_STATE_00,
 	HT_STATE_01,
@@ -92,7 +92,7 @@ struct Vmm {
 	uint64_t	ts_marker;
 	struct {
 		enum	HTState state;
-		unsigned	bits;
+		unsigned	bit_i;
 		uint32_t	mask;
 		uint64_t	ht;
 		uint64_t	vmm_ts_prev;
@@ -107,6 +107,7 @@ struct Vmm {
 	uint64_t	ts_recent;
 };
 
+static double g_ms_period = -1.0;
 static struct Vmm *g_vmm_arr;
 static size_t g_vmm_num;
 
@@ -134,31 +135,20 @@ ungray(uint32_t a_u)
 	return g_ungray[a_u];
 }
 
-/*
- * pl -> ecl1: 0,20 -- 1,1 -- 0,43 -- 0,62
- * ht -> ecl2: 0,63 -- 1,0 -- 1,22 -- 1,41
- * ht -> ecl3: 2,63 -- 3,0 -- 3,22 -- 3,41
- * pl -> ecl4: 2,20 -- 3,1 -- 2,43 -- 2,62
- */
-
 int
 is_ht_ch(unsigned a_vmm_i, unsigned a_ch_i)
 {
-	return
-	    0 == a_vmm_i && 63 == a_ch_i ||
-	    1 == a_vmm_i &&  0 == a_ch_i ||
-	    2 == a_vmm_i && 63 == a_ch_i ||
-	    3 == a_vmm_i &&  0 == a_ch_i;
+	return 0*
+	    (0 == a_vmm_i &&  3 == a_ch_i) /*||
+	    (1 == a_vmm_i && 37 == a_ch_i)*/;
 }
 
 int
 is_ms_ch(unsigned a_vmm_i, unsigned a_ch_i)
 {
 	return
-	    0 == a_vmm_i && 20 == a_ch_i ||
-	    1 == a_vmm_i &&  1 == a_ch_i ||
-	    2 == a_vmm_i && 20 == a_ch_i ||
-	    3 == a_vmm_i &&  1 == a_ch_i;
+	    (0 == a_vmm_i &&  1 == a_ch_i) ||
+	    (1 == a_vmm_i && 53 == a_ch_i);
 }
 
 struct Vmm *
@@ -185,24 +175,38 @@ void
 process_ht(unsigned a_vmm_i, unsigned a_ch_i, uint64_t a_ts_curr)
 {
 	struct Vmm *vmm = vmm_get(a_vmm_i);
-	double dt = T2NS * (a_ts_curr - vmm->ht_build.vmm_ts_prev);
+	double dt = TS2NS * (a_ts_curr - vmm->ht_build.vmm_ts_prev);
 	int do_incr = 0;
+
+if(0)printf("%u %2u %016llx %016llx %f\n",
+	a_vmm_i, a_ch_i,
+	(unsigned long long)vmm->ht_build.vmm_ts_prev,
+	(unsigned long long)a_ts_curr, dt);
 
 #define HT_PERIOD 5.24288
 #define HT_ZERO 0.16384
 #define HT_ONE 0.65536
 #define APPROX(ms) fabs(dt - 1e6 * (ms)) < 1e4
 #define HT_LOST(msg) do { \
-		fprintf(stderr, "vmm=%u: Heimtime sync lost, expected " msg \
-		    "!\n", a_vmm_i); \
-		vmm->ht_build.state = HT_STATE_PERIODIC; \
+		printf("vmm=%u: Heimtime sync lost, expected " msg \
+		    " but got dt=%f (%llx->%llx)!\n", a_vmm_i, dt, \
+		    (unsigned long long)vmm->ht_build.vmm_ts_prev, \
+		    (unsigned long long)a_ts_curr); \
+		vmm->ht_build.state = HT_STATE_NONE; \
+		vmm->ht_build.ht = 0; \
 	} while (0)
 	switch (vmm->ht_build.state) {
+	case HT_STATE_NONE:
+		if (APPROX(HT_PERIOD)) {
+			printf("vmm=%u: Heimtime locked!\n", a_vmm_i);
+			vmm->ht_build.state = HT_STATE_PERIODIC;
+		}
+		break;
 	case HT_STATE_PERIODIC:
 		if (APPROX(HT_PERIOD)) {
 			do_incr = 1;
 			vmm->ht_build.mask = 0;
-			vmm->ht_build.bits = 0;
+			vmm->ht_build.bit_i = 0;
 		} else if (APPROX(HT_ZERO)) {
 			vmm->ht_build.state = HT_STATE_00;
 		} else if (APPROX(HT_ONE)) {
@@ -215,33 +219,33 @@ process_ht(unsigned a_vmm_i, unsigned a_ch_i, uint64_t a_ts_curr)
 		if (APPROX(HT_ZERO)) {
 			vmm->ht_build.state = HT_STATE_01;
 		} else {
-			HT_LOST("2nd zero");
+			HT_LOST("2nd 0");
 		}
 		break;
 	case HT_STATE_01:
 		if (APPROX(HT_PERIOD - 2 * HT_ZERO)) {
-			++vmm->ht_build.bits;
+			++vmm->ht_build.bit_i;
 			vmm->ht_build.state = HT_STATE_PERIODIC;
 			do_incr = 1;
 		} else {
-			HT_LOST("period after 2nd zero");
+			HT_LOST("period after 2nd 0");
 		}
 		break;
 	case HT_STATE_10:
 		if (APPROX(HT_ONE)) {
 			vmm->ht_build.state = HT_STATE_11;
 		} else {
-			HT_LOST("2nd one");
+			HT_LOST("2nd 1");
 		}
 		break;
 	case HT_STATE_11:
 		if (APPROX(HT_PERIOD - 2 * HT_ONE)) {
-			vmm->ht_build.mask |= 1 << vmm->ht_build.bits;
-			++vmm->ht_build.bits;
+			vmm->ht_build.mask |= 1 << vmm->ht_build.bit_i;
+			++vmm->ht_build.bit_i;
 			vmm->ht_build.state = HT_STATE_PERIODIC;
 			do_incr = 1;
 		} else {
-			HT_LOST("period after 2nd one");
+			HT_LOST("period after 2nd 1");
 		}
 		break;
 	}
@@ -250,30 +254,30 @@ process_ht(unsigned a_vmm_i, unsigned a_ch_i, uint64_t a_ts_curr)
 		vmm->ht_build.ht += 1 << 19;
 		vmm->ht_build.vmm_ts = a_ts_curr;
 		if (0)
-			fprintf(stderr, "vmm=%u: TS1 = %08x%08x  HT1 = %08x%08x\n",
+			printf("vmm=%u: TS1 = %08x%08x  HT1 = %08x%08x\n",
 			    a_vmm_i,
 			    PF_TS(vmm->ht_build.vmm_ts),
 			    PF_TS(vmm->ht_build.ht));
 	}
-	if (32 == vmm->ht_build.bits) {
+	if (32 == vmm->ht_build.bit_i) {
 		/* Full Heimtime decoded! */
 		struct TsPair *pair;
 		uint64_t ht = (uint64_t)vmm->ht_build.mask << 24;
 
 		if (vmm->ht_build.ht > 0 && vmm->ht_build.ht != ht) {
-			fprintf(stderr, "vmm=%u: Heimtime got=%08x%08x but "
+			printf("vmm=%u: Heimtime got=%08x%08x but "
 			    "expected=%08x%08x!\n",
 			    a_vmm_i,
 			    PF_TS(ht),
 			    PF_TS(vmm->ht_build.ht));
 		}
+		vmm->ht_build.state = HT_STATE_PERIODIC;
+		vmm->ht_build.bit_i = 0;
+		vmm->ht_build.mask = 0;
 		vmm->ht_build.ht = ht;
 		vmm->ht_build.vmm_ts = a_ts_curr;
-		vmm->ht_build.state = HT_STATE_PERIODIC;
-		vmm->ht_build.mask = 0;
-		vmm->ht_build.bits = 0;
 		if (0)
-			fprintf(stderr, "vmm=%u: Lock TS1 = %08x%08x  HT1 = %08x%08x\n",
+			printf("vmm=%u: Lock TS1 = %08x%08x  HT1 = %08x%08x\n",
 			    a_vmm_i,
 			    PF_TS(vmm->ht_build.vmm_ts),
 			    PF_TS(vmm->ht_build.ht));
@@ -291,29 +295,38 @@ process_ht(unsigned a_vmm_i, unsigned a_ch_i, uint64_t a_ts_curr)
 void
 process_hit(uint32_t a_u32, uint16_t a_u16)
 {
-	uint32_t ofs = 0x1f & (a_u32 >> 27);
+	/* TODO: Only 4 bits used? */
+	int32_t ofs = 0x1f & (a_u32 >> 27);
 	uint32_t vmm_i = 0x1f & (a_u32 >> 22);
 	uint32_t adc = 0x3ff & (a_u32 >> 12);
 	uint32_t bcid = ungray(0xfff & a_u32);
-	uint32_t over = 0x1 & (a_u16 >> 14);
+	/* uint32_t over = 0x1 & (a_u16 >> 14); */
 	uint32_t ch_i = 0x3f & (a_u16 >> 8);
 	uint32_t tdc = 0xff & a_u16;
 
 	struct Vmm *vmm;
 	uint64_t ts;
 
+	/* Wireshark haxx! */
+	if (16 == ofs) {
+		ofs = 5;
+	}
+	if (31 == ofs) {
+		ofs = -1;
+	}
+
 	if (0)
-		printf("Vmm = %2u  "
-		    "Ch = %2u  "
-		    "A/T = %4u/%4u  "
-		    "Ofs/BCID = %2u/%4u\n",
+		printf("vmm=%2u  "
+		    "ch=%2u  "
+		    "a/t=%4u/%4u  "
+		    "ofs/bcid=%3d/%4u\n",
 		    vmm_i,
 		    ch_i,
 		    adc, tdc,
 		    ofs, bcid);
 
 	vmm = vmm_get(vmm_i);
-	ts = vmm->ts_marker | ofs << 12 | bcid;
+	ts = vmm->ts_marker + (ofs * 4096) + bcid;
 	if (0)
 		printf("%08x%08x\n", PF_TS(ts));
 
@@ -322,6 +335,21 @@ process_hit(uint32_t a_u32, uint16_t a_u16)
 		process_ht(vmm_i, ch_i, ts);
 	} else if (is_ms_ch(vmm_i, ch_i)) {
 		struct TsPair *ms;
+
+		if (0 == vmm_i && g_ms_period > 0.0 && CIRC_GETNUM(vmm->ms) > 0) {
+			CIRC_PEEK_REV(ms, vmm->ms, 0);
+			if (ms->vmm_ts) {
+				uint64_t dts = ts - ms->vmm_ts;
+				double dt = dts * TS2NS * 1e-6;
+				double e = fabs(dt - g_ms_period);
+				if (1 || e > 1e-2) {
+					printf("%08x%08x %08x%08x(%08x%08x %3d %03x) %f %s\n",
+						PF_TS(ms->vmm_ts),
+						PF_TS(ts), PF_TS(vmm->ts_marker), ofs, bcid,
+						dt, e>1e-2?"bad":"ok");
+				}
+			}
+		}
 
 		/* Master start. */
 		CIRC_PUSH(ms, "master-start", vmm->ms, 1);
@@ -344,19 +372,20 @@ process_marker(uint32_t a_u32, uint16_t a_u16)
 	uint32_t vmm_i = 0x1f & (a_u16 >> 10);
 	uint32_t ts_lo = 0x3ff & a_u16;
 	uint32_t ts_hi = a_u32;
-	uint64_t ts = ts_hi << 10 | ts_lo;
+	uint64_t ts = (uint64_t)ts_hi << 10 | ts_lo;
 
 	struct Vmm *vmm;
 
-	if (0)
-		printf("VMM = %2u  "
-		    "TS = 0x%08x%08x\n",
+	if (0==vmm_i)
+		printf("vmm=%2u  "
+		    "%08x:%04x  "
+		    "ts=0x%08x%08x\n",
 		    vmm_i,
+		    a_u32, a_u16,
 		    PF_TS(ts));
 
 	vmm = vmm_get(vmm_i);
-	/* TODO: Report bug? */
-	vmm->ts_marker = ts & ~0xffff;
+	vmm->ts_marker = ts/* & ~0xffff*/;
 }
 
 /* Drops hits until 1st MS left edge, or if span > RoI. */
@@ -383,7 +412,7 @@ clean_hits()
 
 				CIRC_PEEK(hit, vmm->hit, 0);
 				roi = (ROI_RIGHT_US - ROI_LEFT_US) * 1e3 /
-				    T2NS * 2;
+				    TS2NS * 2;
 				if (SUBMOD(hit_last->vmm_ts, hit->vmm_ts,
 				    1 << 30) < roi) {
 					break;
@@ -393,11 +422,11 @@ clean_hits()
 		} else {
 			/* Drop hits until 1st MS left edge. */
 			struct TsPair const *ms;
-			uint64_t roi_left, roi_right;
+			uint64_t roi_left/*, roi_right*/;
 
 			CIRC_PEEK(ms, vmm->ms, 0);
 			roi_left = ms->vmm_ts + ROI_LEFT;
-			roi_right = ms->vmm_ts + ROI_RIGHT;
+			/* roi_right = ms->vmm_ts + ROI_RIGHT; */
 
 			while (CIRC_GETNUM(vmm->hit) > 0) {
 				struct Hit const *hit;
@@ -447,7 +476,7 @@ find_ht_span:
 		CIRC_PEEK(ht0, vmm->ht, 0);
 		if (SUBMOD(ht0->vmm_ts, ms->vmm_ts, 1 << 30) > 0) {
 			/* 1st HT is after 1st MS, problem! */
-if(0)			fprintf(stderr, "1st MS before 1st HT, dropping!\n");
+if(0)			printf("1st MS before 1st HT, dropping!\n");
 			CIRC_DROP(vmm->ms);
 			goto find_ms;
 		}
@@ -519,7 +548,7 @@ ms_timeout(void)
 		}
 		CIRC_PEEK(ms, vmm->ms, 0);
 		dt = SUBMOD(vmm->ts_recent, ms->vmm_ts, 1 << 30);
-		if (dt > MS_TIMEOUT_S / (T2NS * 1e-9)) {
+		if (dt > MS_TIMEOUT_S / (TS2NS * 1e-9)) {
 			/* This VMM is timing out, emit. */
 			if (0) printf("MS timeout!\n");
 			return 1;
@@ -642,8 +671,6 @@ roi()
 {
 	/* Find as many ROI's as possible in current data. */
 	for (;;) {
-		int do_emit;
-
 		/* Clean hits. */
 		clean_hits();
 
@@ -708,7 +735,7 @@ mon(void)
 	for (i = 0; i < g_vmm_num; ++i) {
 		struct Vmm *vmm = &g_vmm_arr[i];
 
-		printf("%u: ht=%u ms=%u hit=%u\n",
+		printf("%u: #ht=%u #ms=%u #hit=%u\n",
 			(unsigned)i,
 			(unsigned)((vmm->ht.wr_i - vmm->ht.rd_i) %
 			LENGTH(vmm->ht.arr)),
@@ -720,89 +747,83 @@ mon(void)
 }
 
 int
-main()
+main(int argc, char **argv)
 {
-	struct sockaddr_in addr;
+	uint8_t buf[1 << 16];
+	char const *path =
+		"/home/hydra-tpc/hydra-drasi/srs-debian-bullseye-x86-64-v0.1.3-root-6-32-08/bin/fifo.bin";
 	int fd;
-	size_t buf_ofs = 16;
+	size_t buf_bytes = 0;
+	unsigned block_left = 0;
 	uint32_t frame_prev = 0xffffffff;
-	int has_header = 0;
+	int opt;
 
-#define FROM_FILE 1
-#if FROM_FILE
-	fd = open("/home/hydra-tpc/new/v010/srs-install/bin/tjohej.bin",
-	    O_RDONLY);
+	while ((opt = getopt(argc, argv, "f:m:")) != -1) {
+		switch (opt) {
+		case 'f':
+			path = optarg;
+			break;
+		case 'm':
+			g_ms_period = strtod(optarg, NULL);
+			break;
+		default:
+			fprintf(stderr, "Usage: %s [-f path.bin] [-m ms]\n",
+					argv[0]);
+			exit(EXIT_FAILURE);
+		}
+	}
+
+	fd = open(path, O_RDONLY);
 	if (-1 == fd) {
-		err(EXIT_FAILURE, "open");
+		err(EXIT_FAILURE, "open(%s)", path);
 	}
-#else
-	{
-		fd = socket(AF_INET, SOCK_DGRAM, 0);
-		if (-1 == fd) {
-			err(EXIT_FAILURE, "socket");
-		}
-		memset(&addr, 0, sizeof addr);
-		addr.sin_family = AF_INET;
-		addr.sin_addr.s_addr = INADDR_ANY;
-		addr.sin_port = htons(9000);
-		if (bind(fd, (void *)&addr, sizeof addr) < 0) {
-			err(EXIT_FAILURE, "bind");
-		}
-	}
-#endif
+
+/*
+ * Latest format, big endian:
+ * 32-bit block size, excludes itself.
+ * 32-bit frame counter.
+ * 32-bit header.
+ * 32+16 bit markers/hits.
+ */
 
 	for (;;) {
-		/* 16 potential data from last read + new buf. */
-#define BUF_SIZE (1 << 16)
-		uint8_t buf[16 + BUF_SIZE];
-		ssize_t bytes, end, i, len;
+		ssize_t bytes, i;
 
 		/* Read block. */
-#if FROM_FILE
-		bytes = read(fd, buf + 16, sizeof buf - 16);
-#else
-		{
-			socklen_t socklen;
-
-			socklen = sizeof addr;
-			bytes = recvfrom(fd, buf + 16, sizeof buf - 16,
-			    MSG_WAITALL, (void *)&addr, &socklen);
-		}
-#endif
+		bytes = read(fd, buf + buf_bytes, sizeof buf - buf_bytes);
 		if (-1 == bytes) {
 			err(EXIT_FAILURE, "read");
 		} else if (0 == bytes) {
 			break;
 		}
+		buf_bytes += bytes;
 
 		/* Parse block. */
-#define BUF_R32(ofs) ntohl(*(uint32_t const *)(buf + i + ofs))
-#define BUF_R16(ofs) ntohs(*(uint16_t const *)(buf + i + ofs))
-		end = 16 + bytes;
-		for (i = buf_ofs; i < end;) {
+#define BUF_R32(ofs) ntohl(*(uint32_t const *)(buf + i + (ofs)))
+#define BUF_R16(ofs) ntohs(*(uint16_t const *)(buf + i + (ofs)))
+		for (i = 0; i < buf_bytes - 3 * sizeof(uint32_t);) {
 			uint32_t id;
 
-			if (i + 4 * sizeof(uint32_t) > end) {
-				break;
-			}
-
-			id = BUF_R32(4);
+			id = BUF_R32(2 * sizeof(uint32_t));
 			if ((0xffffff00 & id) == 0x564d3300) {
 				uint32_t frame;
 
 				/* Looks like a header. */
-				frame = BUF_R32(0);
+				block_left = BUF_R32(0);
+				frame = BUF_R32(1 * sizeof(uint32_t));
 				if (0xffffffff != frame_prev &&
 				    frame_prev + 1 != frame) {
-					fprintf(stderr, "Frame counter "
+					printf("Frame counter "
 					    "mismatch (0x%08x -> 0x%08x)!\n",
 					    frame_prev, frame);
 				}
+				/* udp timestamp = BUF_R32(12). */
+				/* ofs overflow = BUF_R32(16). */
 				frame_prev = frame;
 
-				i += 4 * sizeof(uint32_t);
-				has_header = 1;
-			} else if (has_header) {
+				i += 5 * sizeof(uint32_t);
+				block_left -= 4 * sizeof(uint32_t);
+			} else if (block_left >= 6) {
 				uint32_t u32;
 				uint16_t u16;
 				unsigned is_hit;
@@ -812,6 +833,7 @@ main()
 				i += sizeof(uint32_t);
 				u16 = BUF_R16(0);
 				i += sizeof(uint16_t);
+				block_left -= 6;
 
 				is_hit = 0x8000 & u16;
 				if (is_hit) {
@@ -819,18 +841,20 @@ main()
 				} else {
 					process_marker(u32, u16);
 				}
+			} else {
+				++i;
+				block_left = 0;
 			}
 		}
 
-		mon();
+		if(0)mon();
 
 		/* Look for ROI's. */
 		roi();
 
 		/* Move any remaining data to the pre-buf space. */
-		len = end - i;
-		buf_ofs = 16 - len;
-		memcpy(buf + buf_ofs, buf + i, len);
+		buf_bytes -= i;
+		memmove(buf, buf + i, buf_bytes);
 	}
 	return 0;
 }
