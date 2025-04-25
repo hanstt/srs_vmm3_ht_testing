@@ -31,6 +31,7 @@ static uint32_t g_marker_vmm;
 static uint64_t g_marker_ts;
 static uint32_t g_hit;
 static uint32_t g_hit_ofs;
+static int g_hit_ofs_signed;
 static uint32_t g_hit_vmm;
 static uint32_t g_hit_adc;
 static uint32_t g_hit_bcid;
@@ -86,13 +87,14 @@ vmm_get(unsigned a_i)
 void
 process_hit(uint32_t a_u32, uint16_t a_u16)
 {
-  uint32_t ofs = 0x1f & (a_u32 >> 27);
-  uint32_t vmm_i = 0x1f & (a_u32 >> 22);
-  uint32_t adc = 0x3ff & (a_u32 >> 12);
-  uint32_t bcid = ungray(0xfff & a_u32);
-  uint32_t over = 0x1 & (a_u16 >> 14);
-  uint32_t ch_i = 0x3f & (a_u16 >> 8);
-  uint32_t tdc = 0xff & a_u16;
+  int32_t ofs = 0x1f & (a_u32 >> 27);
+  if (ofs == 31) ofs = -1;
+  int32_t vmm_i = 0x1f & (a_u32 >> 22);
+  int32_t adc = 0x3ff & (a_u32 >> 12);
+  int32_t bcid = ungray(0xfff & a_u32);
+  int32_t over = 0x1 & (a_u16 >> 14);
+  int32_t ch_i = 0x3f & (a_u16 >> 8);
+  int32_t tdc = 0xff & a_u16;
 
   struct Vmm *vmm;
   uint64_t ts;
@@ -108,10 +110,11 @@ process_hit(uint32_t a_u32, uint16_t a_u16)
         ofs, bcid);
 
   vmm = vmm_get(vmm_i);
-  ts = vmm->ts_marker | ofs << 12 | bcid;
+  ts = (int64_t)vmm->ts_marker + ofs * 4096 + bcid;
 
   g_hit = 1;
   g_hit_ofs  = ofs;
+  g_hit_ofs_signed = ofs;
   g_hit_vmm  = vmm_i;
   g_hit_adc  = adc;
   g_hit_bcid = bcid;
@@ -183,7 +186,7 @@ main(int argc, char **argv)
   tree->Branch("marker_vmm", &g_marker_vmm, "marker_vmm[marker]/i");
   tree->Branch("marker_ts",  &g_marker_ts,  "marker_ts[marker]/l");
   tree->Branch("hit",        &g_hit,        "hit/i");
-  tree->Branch("hit_ofs",    &g_hit_ofs,    "hit_ofs[hit]/i");
+  tree->Branch("hit_ofs",    &g_hit_ofs_signed,    "hit_ofs[hit]/I");
   tree->Branch("hit_vmm",    &g_hit_vmm,    "hit_vmm[hit]/i");
   tree->Branch("hit_adc",    &g_hit_adc,    "hit_adc[hit]/i");
   tree->Branch("hit_bcid",   &g_hit_bcid,   "hit_bcid[hit]/i");
