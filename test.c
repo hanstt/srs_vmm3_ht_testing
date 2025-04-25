@@ -71,15 +71,6 @@
     for (idx = circ.rd_i; idx != circ.wr_i; \
 	idx = (idx + 1) & (LENGTH(circ.arr) - 1))
 
-enum HTState {
-	HT_STATE_NONE,
-	HT_STATE_PERIODIC,
-	HT_STATE_00,
-	HT_STATE_01,
-	HT_STATE_10,
-	HT_STATE_11,
-};
-
 struct TsPair {
 	uint64_t	ht;
 	uint64_t	vmm_ts;
@@ -91,12 +82,11 @@ struct Hit {
 struct Vmm {
 	uint64_t	ts_marker;
 	struct {
-		enum	HTState state;
+		double	dt_arr[3];
 		unsigned	bit_i;
 		uint32_t	mask;
-		uint64_t	ht;
+		uint32_t	ht;
 		uint64_t	vmm_ts_prev;
-		uint64_t	vmm_ts;
 	} ht_build;
 	/* 16 * 0.671 ms ~= 10 s. */
 	CIRC_DECL(TsPair, 16) ht;
@@ -107,7 +97,6 @@ struct Vmm {
 	uint64_t	ts_recent;
 };
 
-static double g_ms_period = -1.0;
 static struct Vmm *g_vmm_arr;
 static size_t g_vmm_num;
 
@@ -138,7 +127,7 @@ ungray(uint32_t a_u)
 int
 is_ht_ch(unsigned a_vmm_i, unsigned a_ch_i)
 {
-	return 0*
+	return
 	    (0 == a_vmm_i &&  3 == a_ch_i) /*||
 	    (1 == a_vmm_i && 37 == a_ch_i)*/;
 }
@@ -175,118 +164,106 @@ void
 process_ht(unsigned a_vmm_i, unsigned a_ch_i, uint64_t a_ts_curr)
 {
 	struct Vmm *vmm = vmm_get(a_vmm_i);
-	double dt = TS2NS * (a_ts_curr - vmm->ht_build.vmm_ts_prev);
-	int do_incr = 0;
+	double dt;
+
+	if (a_ts_curr > vmm->ht_build.vmm_ts_prev) {
+		dt = TS2NS * (a_ts_curr - vmm->ht_build.vmm_ts_prev);
+	} else dt = 0.0;
+
+	memmove(&vmm->ht_build.dt_arr[0], &vmm->ht_build.dt_arr[1],
+	    (LENGTH(vmm->ht_build.dt_arr) - 1) * sizeof(*vmm->ht_build.dt_arr));
+	vmm->ht_build.dt_arr[LENGTH(vmm->ht_build.dt_arr) - 1] = dt;
 
 if(0)printf("%u %2u %016llx %016llx %f\n",
 	a_vmm_i, a_ch_i,
 	(unsigned long long)vmm->ht_build.vmm_ts_prev,
 	(unsigned long long)a_ts_curr, dt);
+if(0)printf("%u %2u  %6.3f,%6.3f,%6.3f\n",
+	a_vmm_i, a_ch_i,
+	1e-6 * vmm->ht_build.dt_arr[0],
+	1e-6 * vmm->ht_build.dt_arr[1],
+	1e-6 * vmm->ht_build.dt_arr[2]);
 
-#define HT_PERIOD 5.24288
-#define HT_ZERO 0.16384
-#define HT_ONE 0.65536
-#define APPROX(ms) fabs(dt - 1e6 * (ms)) < 1e4
+#define HT_P 5.24288
+#define HT_0 0.16384
+#define HT_1 0.65536
+#define APPROX(i, ms) fabs(vmm->ht_build.dt_arr[i] - 1e6 * (ms)) < 1e4
 #define HT_LOST(msg) do { \
 		printf("vmm=%u: Heimtime sync lost, expected " msg \
 		    " but got dt=%f (%llx->%llx)!\n", a_vmm_i, dt, \
 		    (unsigned long long)vmm->ht_build.vmm_ts_prev, \
 		    (unsigned long long)a_ts_curr); \
-		vmm->ht_build.state = HT_STATE_NONE; \
+		vmm->ht_build.state = HT_HAD_NONE; \
 		vmm->ht_build.ht = 0; \
 	} while (0)
-	switch (vmm->ht_build.state) {
-	case HT_STATE_NONE:
-		if (APPROX(HT_PERIOD)) {
-			printf("vmm=%u: Heimtime locked!\n", a_vmm_i);
-			vmm->ht_build.state = HT_STATE_PERIODIC;
-		}
-		break;
-	case HT_STATE_PERIODIC:
-		if (APPROX(HT_PERIOD)) {
-			do_incr = 1;
-			vmm->ht_build.mask = 0;
-			vmm->ht_build.bit_i = 0;
-		} else if (APPROX(HT_ZERO)) {
-			vmm->ht_build.state = HT_STATE_00;
-		} else if (APPROX(HT_ONE)) {
-			vmm->ht_build.state = HT_STATE_10;
-		} else {
-			HT_LOST("periodic");
-		}
-		break;
-	case HT_STATE_00:
-		if (APPROX(HT_ZERO)) {
-			vmm->ht_build.state = HT_STATE_01;
-		} else {
-			HT_LOST("2nd 0");
-		}
-		break;
-	case HT_STATE_01:
-		if (APPROX(HT_PERIOD - 2 * HT_ZERO)) {
-			++vmm->ht_build.bit_i;
-			vmm->ht_build.state = HT_STATE_PERIODIC;
-			do_incr = 1;
-		} else {
-			HT_LOST("period after 2nd 0");
-		}
-		break;
-	case HT_STATE_10:
-		if (APPROX(HT_ONE)) {
-			vmm->ht_build.state = HT_STATE_11;
-		} else {
-			HT_LOST("2nd 1");
-		}
-		break;
-	case HT_STATE_11:
-		if (APPROX(HT_PERIOD - 2 * HT_ONE)) {
-			vmm->ht_build.mask |= 1 << vmm->ht_build.bit_i;
-			++vmm->ht_build.bit_i;
-			vmm->ht_build.state = HT_STATE_PERIODIC;
-			do_incr = 1;
-		} else {
-			HT_LOST("period after 2nd 1");
-		}
-		break;
-	}
-	if (do_incr && vmm->ht_build.ht > 0) {
-		/* Advance Heimtime on every 2^19-pulse. */
-		vmm->ht_build.ht += 1 << 19;
-		vmm->ht_build.vmm_ts = a_ts_curr;
-		if (0)
-			printf("vmm=%u: TS1 = %08x%08x  HT1 = %08x%08x\n",
-			    a_vmm_i,
-			    PF_TS(vmm->ht_build.vmm_ts),
-			    PF_TS(vmm->ht_build.ht));
+	/*
+	 * Zero with missing pulse:
+	 * |...|016|016|491|...|
+	 * |.......|016|491|...|
+	 * |...|  032  |491|...|
+	 * |...|016|  507  |...|
+	 * |...|016|016|.......|
+	 *
+	 * One with missing pulse:
+	 * |...|065|065|393|...|
+	 * |.......|065|393|...|
+	 * |...|  131  |393|...|
+	 * |...|065|  458  |...|
+	 * |...|065|065|.......|
+	 */
+	if (APPROX(2, HT_P)) {
+		vmm->ht_build.bit_i = 0;
+		vmm->ht_build.mask = 0;
+	} else if (
+	    (APPROX(1,   HT_0) && APPROX(2, HT_P-2*HT_0)) ||
+	    (APPROX(0, 2*HT_0) && APPROX(2, HT_P-2*HT_0)) ||
+	    (APPROX(0,   HT_0) && APPROX(2, HT_P-  HT_0)) ||
+	    (APPROX(0,   HT_0) && APPROX(1, HT_0))) {
+if(0)printf("%2u: 0\n", vmm->ht_build.bit_i);
+		++vmm->ht_build.bit_i;
+	} else if (
+	    (APPROX(1,   HT_1) && APPROX(2, HT_P-2*HT_1)) ||
+	    (APPROX(0, 2*HT_1) && APPROX(2, HT_P-2*HT_1)) ||
+	    (APPROX(0,   HT_1) && APPROX(2, HT_P-  HT_1)) ||
+	    (APPROX(0,   HT_1) && APPROX(1, HT_1))) {
+if(0)printf("%2u: 1\n", vmm->ht_build.bit_i);
+		vmm->ht_build.mask |= 1 << vmm->ht_build.bit_i;
+		++vmm->ht_build.bit_i;
 	}
 	if (32 == vmm->ht_build.bit_i) {
 		/* Full Heimtime decoded! */
 		struct TsPair *pair;
-		uint64_t ht = (uint64_t)vmm->ht_build.mask << 24;
+		uint32_t ht = vmm->ht_build.mask;
 
-		if (vmm->ht_build.ht > 0 && vmm->ht_build.ht != ht) {
-			printf("vmm=%u: Heimtime got=%08x%08x but "
-			    "expected=%08x%08x!\n",
+		/* Heimtimes should increase by 4. */
+if (0)
+		if (vmm->ht_build.ht > 0 && vmm->ht_build.ht + 4 != ht) {
+			printf("vmm=%u: Heimtime got=%08x but "
+			    "expected=%08x!\n",
 			    a_vmm_i,
-			    PF_TS(ht),
-			    PF_TS(vmm->ht_build.ht));
+			    ht,
+			    vmm->ht_build.ht + 4);
 		}
-		vmm->ht_build.state = HT_STATE_PERIODIC;
+		if (vmm->ht_build.ht > 0 && vmm->ht_build.ht >= ht) {
+			printf("vmm=%u: Heimtime nog increasing, had=%08x "
+			    "and got=%08x!\n",
+			    a_vmm_i,
+			    vmm->ht_build.ht,
+			    ht);
+		}
 		vmm->ht_build.bit_i = 0;
 		vmm->ht_build.mask = 0;
 		vmm->ht_build.ht = ht;
-		vmm->ht_build.vmm_ts = a_ts_curr;
 		if (0)
-			printf("vmm=%u: Lock TS1 = %08x%08x  HT1 = %08x%08x\n",
+			printf("vmm=%u: HT = %08x\n",
 			    a_vmm_i,
-			    PF_TS(vmm->ht_build.vmm_ts),
-			    PF_TS(vmm->ht_build.ht));
+			    vmm->ht_build.ht);
 		/*
 		 * Don't complain about lost HT's, will happen when no MS
-		 * coming in. Not great, not terrible.
+		 * coming in.
 		 */
 		CIRC_PUSH(pair, "Heimtime", vmm->ht, 0);
-		pair->ht = ht;
+		pair->ht = (uint64_t)ht << 24;
 		pair->vmm_ts = a_ts_curr;
 	}
 	vmm->ht_build.vmm_ts_prev = a_ts_curr;
@@ -336,21 +313,6 @@ process_hit(uint32_t a_u32, uint16_t a_u16)
 	} else if (is_ms_ch(vmm_i, ch_i)) {
 		struct TsPair *ms;
 
-		if (0 == vmm_i && g_ms_period > 0.0 && CIRC_GETNUM(vmm->ms) > 0) {
-			CIRC_PEEK_REV(ms, vmm->ms, 0);
-			if (ms->vmm_ts) {
-				uint64_t dts = ts - ms->vmm_ts;
-				double dt = dts * TS2NS * 1e-6;
-				double e = fabs(dt - g_ms_period);
-				if (1 || e > 1e-2) {
-					printf("%08x%08x %08x%08x(%08x%08x %3d %03x) %f %s\n",
-						PF_TS(ms->vmm_ts),
-						PF_TS(ts), PF_TS(vmm->ts_marker), ofs, bcid,
-						dt, e>1e-2?"bad":"ok");
-				}
-			}
-		}
-
 		/* Master start. */
 		CIRC_PUSH(ms, "master-start", vmm->ms, 1);
 		ms->vmm_ts = ts;
@@ -376,7 +338,7 @@ process_marker(uint32_t a_u32, uint16_t a_u16)
 
 	struct Vmm *vmm;
 
-	if (0==vmm_i)
+	if (0)
 		printf("vmm=%2u  "
 		    "%08x:%04x  "
 		    "ts=0x%08x%08x\n",
@@ -385,7 +347,7 @@ process_marker(uint32_t a_u32, uint16_t a_u16)
 		    PF_TS(ts));
 
 	vmm = vmm_get(vmm_i);
-	vmm->ts_marker = ts/* & ~0xffff*/;
+	vmm->ts_marker = ts;
 }
 
 /* Drops hits until 1st MS left edge, or if span > RoI. */
@@ -758,13 +720,10 @@ main(int argc, char **argv)
 	uint32_t frame_prev = 0xffffffff;
 	int opt;
 
-	while ((opt = getopt(argc, argv, "f:m:")) != -1) {
+	while ((opt = getopt(argc, argv, "f:")) != -1) {
 		switch (opt) {
 		case 'f':
 			path = optarg;
-			break;
-		case 'm':
-			g_ms_period = strtod(optarg, NULL);
 			break;
 		default:
 			fprintf(stderr, "Usage: %s [-f path.bin] [-m ms]\n",
