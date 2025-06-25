@@ -28,6 +28,7 @@ static uint32_t g_evtcnt;
 struct HtMs {
 	uint16_t	vmm_i;
 	uint64_t	ht;
+	uint16_t	adc;
 };
 HEAP_HEAD(HeapMs, HtMs);
 static struct HeapMs g_ms_heap;
@@ -507,7 +508,7 @@ roi(lwroc_pipe_buffer_consumer *pipe_buf, lwroc_data_pipe_handle *data_handle)
 		*p32++ = WHITE_RABBIT_STAMP_HH16_ID |
 		    (uint32_t)((ht0 >> 48) & 0xffff);
 
-		sync_check = 1000;
+		sync_check = msp->adc;
 
 		*p32++ = SYNC_CHECK_MAGIC | SYNC_CHECK_RECV |
 		    (sync_check & 0xffff);
@@ -530,7 +531,7 @@ roi(lwroc_pipe_buffer_consumer *pipe_buf, lwroc_data_pipe_handle *data_handle)
 			HEAP_EXTRACT(g_ms_heap, ms, fail);
 
 			/* Write MS. */
-			*p32++ = vmm_n << 16 | ms.vmm_i;
+			*p32++ = ms.adc << 16 | ms.vmm_i;
 			*p32++ = (uint32_t)(ms.ht >> 32);
 			*p32++ = (uint32_t)ms.ht;
 			++vmm_n;
@@ -637,6 +638,7 @@ find_ht_span:
 
 				ms.vmm_i = vmm_i;
 				ms.ht = ht;
+				ms.adc = ch->adc;
 				HEAP_INSERT(g_ms_heap, ms, fail);
 			} else {
 				struct HtHit hit;
