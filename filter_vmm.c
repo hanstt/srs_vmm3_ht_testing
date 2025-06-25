@@ -23,6 +23,8 @@
 /* Wait this long until we start building events. */
 #define HT_DT_SAFE 1.0
 
+static uint32_t g_evtcnt;
+
 struct HtMs {
 	uint16_t	vmm_i;
 	uint64_t	ht;
@@ -627,12 +629,12 @@ emit(lwroc_pipe_buffer_consumer *pipe_buf, lwroc_data_pipe_handle
     *data_handle)
 {
 	struct TsPair const *ms_earliest;
-	uint32_t *dstp;
+	uint32_t *p32;
 	size_t i;
 	uint64_t ht, ts;
 	uint32_t header_size;
 	uint32_t wr_size;
-	uint32_t event_size;
+	uint32_t payload_size;
 	uint32_t write_size;
 	uint32_t sync_check;
 
@@ -647,31 +649,31 @@ emit(lwroc_pipe_buffer_consumer *pipe_buf, lwroc_data_pipe_handle
 	header_size = (sizeof (lmd_subevent_10_1_host) +
 	    sizeof (lmd_event_10_1_host));
 	wr_size = (5 + 1) * sizeof (uint32_t);
-	event_size = 4;
+	payload_size = 4;
 
-	write_size = header_size + wr_size + event_size;
+	write_size = header_size + wr_size + payload_size;
 
-	dstp = (void *)lwroc_request_event_space(data_handle, write_size);
+	p32 = (void *)lwroc_request_event_space(data_handle, write_size);
 
 	ts = 123456;
 
-	dstp[0] = (WR_ID << WHITE_RABBIT_STAMP_EBID_BRANCH_ID_SHIFT) &
+	p32[0] = (WR_ID << WHITE_RABBIT_STAMP_EBID_BRANCH_ID_SHIFT) &
 	    WHITE_RABBIT_STAMP_EBID_BRANCH_ID_MASK;
-	dstp[1] = WHITE_RABBIT_STAMP_LL16_ID |
+	p32[1] = WHITE_RABBIT_STAMP_LL16_ID |
 	    (uint32_t)((ts >>  0) & 0xffff);
-	dstp[2] = WHITE_RABBIT_STAMP_LH16_ID |
+	p32[2] = WHITE_RABBIT_STAMP_LH16_ID |
 	    (uint32_t)((ts >> 16) & 0xffff);
-	dstp[3] = WHITE_RABBIT_STAMP_HL16_ID |
+	p32[3] = WHITE_RABBIT_STAMP_HL16_ID |
 	    (uint32_t)((ts >> 32) & 0xffff);
-	dstp[4] = WHITE_RABBIT_STAMP_HH16_ID |
+	p32[4] = WHITE_RABBIT_STAMP_HH16_ID |
 	    (uint32_t)((ts >> 48) & 0xffff);
 
 	sync_check = 1000;
 
-	dstp[5] = SYNC_CHECK_MAGIC | SYNC_CHECK_RECV |
+	p32[5] = SYNC_CHECK_MAGIC | SYNC_CHECK_RECV |
 	    (sync_check & 0xffff);
 
-	dstp += wr_size / 4;
+	p32 += wr_size / 4;
 
 
 	if (0)
@@ -754,10 +756,14 @@ roi(lwroc_pipe_buffer_consumer *pipe_buf, lwroc_data_pipe_handle *data_handle)
 		struct HtMs const *msp;
 		uint64_t dht, ht0;
 
-		uint32_t *dstp;
+		void *p0;
+		lmd_event_10_1_host *ev;
+		lmd_subevent_10_1_host *sev;
+		uint32_t *p32;
+		uint8_t *p8;
 		uint32_t header_size;
 		uint32_t wr_size;
-		uint32_t event_size;
+		uint32_t payload_size;
 		uint32_t write_size;
 		uint32_t sync_check;
 
@@ -772,37 +778,40 @@ roi(lwroc_pipe_buffer_consumer *pipe_buf, lwroc_data_pipe_handle *data_handle)
 			break;
 		}
 
-		header_size = (sizeof (lmd_subevent_10_1_host) +
-		    sizeof (lmd_event_10_1_host));
-		wr_size = (5 + 1) * sizeof (uint32_t);
-		event_size = 4;
+		/* Build LMD event. */
 
-		write_size = header_size + wr_size + event_size;
+		header_size = sizeof ev + sizeof sev;
+		wr_size = (1 + 4 + 1) * sizeof (uint32_t);
+		payload_size = 0x10000;
 
-		dstp = (void *)lwroc_request_event_space(data_handle,
-		    write_size);
+		write_size = header_size + wr_size + payload_size;
 
-		dstp[0] = (WR_ID << WHITE_RABBIT_STAMP_EBID_BRANCH_ID_SHIFT) &
+		p0 = lwroc_request_event_space(data_handle, write_size);
+
+		ev = p0;
+		sev = (void *)(ev + 1);
+		p32 = (void *)(sev + 1);
+
+		*p32++ = (WR_ID << WHITE_RABBIT_STAMP_EBID_BRANCH_ID_SHIFT) &
 		    WHITE_RABBIT_STAMP_EBID_BRANCH_ID_MASK;
-		dstp[1] = WHITE_RABBIT_STAMP_LL16_ID |
+		*p32++ = WHITE_RABBIT_STAMP_LL16_ID |
 		    (uint32_t)((ht0 >>  0) & 0xffff);
-		dstp[2] = WHITE_RABBIT_STAMP_LH16_ID |
+		*p32++ = WHITE_RABBIT_STAMP_LH16_ID |
 		    (uint32_t)((ht0 >> 16) & 0xffff);
-		dstp[3] = WHITE_RABBIT_STAMP_HL16_ID |
+		*p32++ = WHITE_RABBIT_STAMP_HL16_ID |
 		    (uint32_t)((ht0 >> 32) & 0xffff);
-		dstp[4] = WHITE_RABBIT_STAMP_HH16_ID |
+		*p32++ = WHITE_RABBIT_STAMP_HH16_ID |
 		    (uint32_t)((ht0 >> 48) & 0xffff);
 
 		sync_check = 1000;
 
-		dstp[5] = SYNC_CHECK_MAGIC | SYNC_CHECK_RECV |
+		*p32++ = SYNC_CHECK_MAGIC | SYNC_CHECK_RECV |
 		    (sync_check & 0xffff);
-
-		dstp += wr_size / 4;
 
 		/* For each VMM with the MS, extract hits in ROI. */
 		while (g_ms_heap.num) {
 			struct HtMs ms;
+			struct Vmm *vmm;
 
 			msp = &g_ms_heap.arr[0];
 			dht = msp->ht - ht0;
@@ -810,9 +819,44 @@ roi(lwroc_pipe_buffer_consumer *pipe_buf, lwroc_data_pipe_handle *data_handle)
 				break;
 			}
 			HEAP_EXTRACT(g_ms_heap, ms, fail);
+
+			/* Write MS. */
+			*p32++ = 1;
+
+			vmm = vmm_get(ms.vmm_i);
+			while (vmm->hit_heap.num) {
+				struct HtHit const *hp;
+				struct HtHit hit;
+
+				hp = &vmm->hit_heap.arr[0];
+				if (ms.ht + ROI_RIGHT_US < hp->ht) {
+					break;
+				}
+				if (hp->ht + ROI_LEFT_US >= ms.ht) {
+					/* Write hit. */
+					*p32++ = 2;
+				}
+				HEAP_EXTRACT(vmm->hit_heap, hit, fail);
+			}
 		}
 
-		lwroc_used_event_space(data_handle, write_size, 0);
+		ev->_header.l_dlen =
+		    ((uintptr_t)p32 - (uintptr_t)(&ev->_header + 1)) / 2;
+		ev->_header.i_type = 10;
+		ev->_header.i_subtype = 1;
+		ev->_info.i_dummy = 0;
+		ev->_info.i_trigger = 1;
+		ev->_info.l_count = ++g_evtcnt;
+		sev->_header.l_dlen =
+		    ((uintptr_t)p32 - (uintptr_t)(&sev->_header + 1)) / 2;
+		sev->_header.i_type = 10;
+		sev->_header.i_subtype = 1;
+		sev->i_procid = 0;
+		sev->h_subcrate = 0;
+		sev->h_control = 0;
+
+		lwroc_used_event_space(data_handle,
+		    (uintptr_t)p32 - (uintptr_t)p0, 0);
 	}
 	return;
 fail:

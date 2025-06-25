@@ -7,5 +7,5 @@
 	--merge-mode=event \
 	--merge-no-validate \
 	--buf=size=100Mi \
-	--max-ev-size=65536 \
+	--max-ev-size=0x10000 \
 	--server=stream:8001

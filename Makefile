@@ -29,7 +29,7 @@ $(ROOTORAMA): rootorama.o
 	$(CXX) $(LDFLAGS) -o $@ $< $(ROOT_LIBS)
 
 $(FILTER_VMM): filter_vmm.o
-	$(CC) $(LDFLAGS) -o $@ $< $(ROOT_LIBS) $(shell CC=gcc $(DRASI_CONFIG) --merge --libs)
+	$(CC) $(LDFLAGS) -o $@ $< $(shell CC=gcc $(DRASI_CONFIG) --merge --libs)
 
 test.o rootorama.o: $(UNGRAY_TABLE)
 
