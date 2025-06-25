@@ -31,6 +31,10 @@ struct HtMs {
 };
 HEAP_HEAD(HeapMs, HtMs);
 static struct HeapMs g_ms_heap;
+/* "Global", total. */
+static size_t	g_ms_heap_maxg;
+/* "Local", since last time. */
+static size_t	g_ms_heap_maxl;
 
 struct HtHit {
 	uint16_t	ch;
@@ -74,7 +78,7 @@ static void roi(lwroc_pipe_buffer_consumer *, lwroc_data_pipe_handle *);
 	size_t	wr_i; \
 	struct	Type arr[N]; \
 }
-#define CIRC_GETNUM(circ) SUBMOD(circ.wr_i, circ.rd_i, LENGTH(circ.arr))
+#define CIRC_GETNUM(circ) ((circ.wr_i - circ.rd_i) % LENGTH(circ.arr))
 #define CIRC_STEP(circ, idx, ofs) ((circ.idx + ofs) & (LENGTH(circ.arr) - 1))
 #define CIRC_PEEK(ptr, circ, ofs) do { \
 	size_t i_; \
@@ -99,7 +103,7 @@ static void roi(lwroc_pipe_buffer_consumer *, lwroc_data_pipe_handle *);
 	circ.wr_i = wr_n; \
 	if (is_full) { \
 		if (do_complain_about_full) { \
-			printf("Too many " name "s, dropping data!\n"); \
+			LWROC_ERROR("Too many " name "s, dropping data!"); \
 		} \
 		circ.rd_i = CIRC_STEP(circ, rd_i, 1); \
 	} \
@@ -127,11 +131,8 @@ struct Vmm {
 	struct {
 		/* Last three pulse diffs to survive lost pulses. */
 		uint32_t	history[4];
-		/* Last known 1<<19 pulse. */
-		struct {
-			int	has;
-			uint32_t	ts_prev;
-		} carry;
+		/* Locked 1<<19 pulses. */
+		int	has_carry;
 		/* HT under construction. */
 		unsigned	bit_i;
 		uint32_t	mask;
@@ -149,6 +150,14 @@ struct Vmm {
 	/* 1<<17 / 1.3 s ~= 100 kHz. */
 	CIRC_DECL(VmmChannel, 1 << 17) ch_buf;
 	struct	HeapHit hit_heap;
+	struct {
+		size_t	ht_maxg;
+		size_t	ht_maxl;
+		size_t	ch_maxg;
+		size_t	ch_maxl;
+		size_t	heap_maxg;
+		size_t	heap_maxl;
+	} stats;
 };
 
 static uint64_t	g_ht_latest;
@@ -240,7 +249,7 @@ process_ht(unsigned a_vmm_i, unsigned a_ch_i, uint32_t a_ts_curr)
 	struct HtPair *pair;
 	size_t i;
 	unsigned bit_ts;
-	int do_bit, do_clear = 0;
+	int do_bit = 0, do_clear = 0, do_inc = 0;
 
 	/* Keep a list of pulse distances. */
 	memmove(
@@ -252,7 +261,7 @@ process_ht(unsigned a_vmm_i, unsigned a_ch_i, uint32_t a_ts_curr)
 		dt_arr[i] =
 		    vmm->ht_build.history[i + 1] - vmm->ht_build.history[i];
 	}
-if(0)printf("%u %2u  %6.3f,%6.3f,%6.3f\n",
+if(0)LWROC_INFO_FMT("%u %2u  %6.3f,%6.3f,%6.3f.",
 	a_vmm_i, a_ch_i,
 	1e-6 * TS2NS * dt_arr[0],
 	1e-6 * TS2NS * dt_arr[1],
@@ -263,46 +272,28 @@ if(0)printf("%u %2u  %6.3f,%6.3f,%6.3f\n",
 #define HT_1 (uint32_t)(0.65536 * 1e6 / TS2NS)
 #define HT_APPROX(l, r) (fabs((l) - (r)) < 2e3)
 
-	if (!vmm->ht_build.carry.has) {
+	if (!vmm->ht_build.has_carry) {
 		/* Find 1<<19 pulses, then we start decoding. */
 		if (!(HT_APPROX(dt_arr[1], HT_P) &&
 		      HT_APPROX(dt_arr[2], HT_P))) {
 			return;
 		}
-		printf("Found HT carry.\n");
-		vmm->ht_build.carry.has = 1;
-		vmm->ht_build.carry.ts_prev = a_ts_curr;
+		LWROC_INFO("Found HT carry.");
+		vmm->ht_build.has_carry = 1;
 		do_clear = 1;
 	}
 
-	/* Create a timestamp for every 1<<19 pulse. */
-	{
-		uint32_t dts;
-		int do_inc;
-
-		dts = a_ts_curr - vmm->ht_build.carry.ts_prev;
-		do_inc = 0;
-		if (HT_APPROX(dts, HT_P)) {
-			do_inc = 1;
-		} else if (HT_APPROX(dts, HT_P)) {
-			/* Lost periodic pulse, increment twice. */
-			do_inc = 2;
-		} else if (dts > HT_P) {
-			fprintf(stderr, "Lost HT carry signal.\n");
-			vmm->ht_build.carry.has = 0;
-			return;
-		}
-		if (do_inc) {
-			vmm->ht_build.carry.ts_prev = a_ts_curr;
-			vmm->ht_build.ht.ht += do_inc << 19;
-			/*
-			 * Don't complain about lost HT's, will happen when no
-			 * MS coming in.
-			 */
-			CIRC_PUSH(pair, "Heimtime", vmm->ht_buf, 0);
-			pair->ht = vmm->ht_build.ht.ht;
-			pair->ts = a_ts_curr;
-		}
+	if (HT_APPROX(dt_arr[0], HT_P)) {
+		do_inc = 1;
+		do_clear = 1;
+	} else if (HT_APPROX(dt_arr[0], 2*HT_P)) {
+		/* Lost periodic pulse, increment twice. */
+		do_inc = 2;
+		do_clear = 1;
+	} else if (dt_arr[0] > 2.5*HT_P) {
+		LWROC_ERROR("Lost HT carry signal.");
+		vmm->ht_build.has_carry = 0;
+		return;
 	}
 
 	/*
@@ -314,7 +305,6 @@ if(0)printf("%u %2u  %6.3f,%6.3f,%6.3f\n",
 	 * The latter two miss a definite timestamp for the ending 1<<19
 	 * pulse, we guesstimate it.
 	 */
-	do_bit = 0;
 #define TEST_BIT(bit) do { \
 	if (HT_APPROX(dt_arr[2], HT_P - 2*HT_##bit) || \
 	    HT_APPROX(dt_arr[2], HT_P - 1*HT_##bit)) { \
@@ -333,6 +323,19 @@ if(0)printf("%u %2u  %6.3f,%6.3f,%6.3f\n",
 	if (do_bit) {
 		vmm->ht_build.mask |= (do_bit - 1) << vmm->ht_build.bit_i;
 		++vmm->ht_build.bit_i;
+		do_inc = 1;
+	}
+
+	/* Create a timestamp for every 1<<19 pulse. */
+	if (do_inc) {
+		vmm->ht_build.ht.ht += do_inc << 19;
+		/*
+		 * Don't complain about lost HT's, will happen when no
+		 * MS coming in.
+		 */
+		CIRC_PUSH(pair, "Heimtime", vmm->ht_buf, 0);
+		pair->ht = vmm->ht_build.ht.ht;
+		pair->ts = a_ts_curr;
 	}
 
 	if (32 == vmm->ht_build.bit_i) {
@@ -341,26 +344,28 @@ if(0)printf("%u %2u  %6.3f,%6.3f,%6.3f\n",
 
 		if (vmm->ht_build.ht.has) {
 			if (vmm->ht_build.ht.ht != ht) {
-				printf("vmm=%u: Heimtime expected=%08x but "
-				    "got=%08x!\n",
+				LWROC_ERROR_FMT(
+				    "vmm=%u: Heimtime expected=%08x "
+				    "but got=%08x!",
 				    a_vmm_i,
 				    vmm->ht_build.ht.ht >> 24,
 				    vmm->ht_build.mask);
 			} else if (vmm->ht_build.ht.ht > ht) {
-				printf("vmm=%u: Heimtime reversed %08x -> "
-				    "%08x!\n",
+				LWROC_ERROR_FMT(
+				    "vmm=%u: Heimtime reversed %08x -> %08x!",
 				    a_vmm_i,
 				    vmm->ht_build.ht.ht >> 24,
 				    vmm->ht_build.mask);
 			}
 		} else {
-			printf("Found HT=0x%08x\n", vmm->ht_build.mask);
+			LWROC_INFO_FMT("Found HT=0x%08x.",
+			    vmm->ht_build.mask);
 		}
 		do_clear = 1;
 		vmm->ht_build.ht.has = 1;
 		vmm->ht_build.ht.ht = ht;
 		if (0)
-			printf("vmm=%u: HT = %08x\n",
+			LWROC_INFO_FMT("vmm=%u: HT = %08x.",
 			    a_vmm_i,
 			    vmm->ht_build.ht);
 	}
@@ -395,10 +400,10 @@ process_hit(uint32_t a_u32, uint16_t a_u16)
 	}
 
 	if (0)
-		printf("vmm=%2u  "
+		LWROC_INFO_FMT("vmm=%2u  "
 		    "ch=%2u  "
 		    "a/t=%4u/%4u  "
-		    "ofs/bcid=%3d/%4u\n",
+		    "ofs/bcid=%3d/%4u.",
 		    vmm_i,
 		    ch_i,
 		    adc, tdc,
@@ -407,7 +412,7 @@ process_hit(uint32_t a_u32, uint16_t a_u16)
 	vmm = vmm_get(vmm_i);
 	ts = vmm->ts_marker + (ofs * 4096) + bcid;
 	if (0)
-		printf("%08x%08x\n", PF_TS(ts));
+		LWROC_INFO_FMT("%08x%08x.", PF_TS(ts));
 
 	if (is_ht_ch(vmm_i, ch_i)) {
 		/* Stop! Heimtime! */
@@ -419,7 +424,7 @@ process_hit(uint32_t a_u32, uint16_t a_u16)
 		CIRC_PUSH(ch, "channel", vmm->ch_buf, 0);
 		ch->ch = ch_i;
 		ch->ts = ts;
-		ch->adc = adc;
+		ch->adc = over << 15 | adc;
 		ch->tdc = tdc;
 	}
 }
@@ -435,9 +440,9 @@ process_marker(uint32_t a_u32, uint16_t a_u16)
 	struct Vmm *vmm;
 
 	if (0)
-		printf("Marker vmm=%2u  "
+		LWROC_INFO_FMT("Marker vmm=%2u  "
 		    "%08x:%04x  "
-		    "ts=0x%08x%08x\n",
+		    "ts=0x%08x%08x.",
 		    vmm_i,
 		    a_u32, a_u16,
 		    PF_TS(ts));
@@ -445,308 +450,6 @@ process_marker(uint32_t a_u32, uint16_t a_u16)
 	vmm = vmm_get(vmm_i);
 	vmm->ts_marker = ts;
 }
-
-#if 0
-/* Drops hits until 1st MS left edge, or if span > RoI. */
-void
-clean_heap()
-{
-	size_t i;
-
-	for (i = 0; i < g_vmm_num; ++i) {
-		struct Vmm *vmm = &g_vmm_arr[i];
-		uint64_t limit_ts;
-
-		if (CIRC_GETNUM(vmm->hit_buf) == 0) {
-			continue;
-		}
-
-		if (CIRC_GETNUM(vmm->ms_buf) == 0) {
-			/* Drop hits until last - RoI. */
-			struct Hit const *hit_last;
-			int64_t span;
-
-			CIRC_PEEK_REV(hit_last, vmm->hit_buf, 0);
-			span = ROI_RIGHT_TS - ROI_LEFT_TS;
-			limit_ts = hit_last->vmm_ts - span;
-		} else {
-			/* Drop hits until MS left edge. */
-			struct TsPair const *ms;
-
-			CIRC_PEEK(ms, vmm->ms_buf, 0);
-			limit_ts = ms->vmm_ts + ROI_LEFT_TS;
-		}
-		while (CIRC_GETNUM(vmm->hit_buf) > 0) {
-			struct Hit const *hit;
-
-			CIRC_PEEK(hit, vmm->hit_buf, 0);
-			if (SUBMOD(limit_ts, hit->vmm_ts, 1 << 30) <= 0) {
-				break;
-			}
-			CIRC_DROP(vmm->hit_buf);
-		}
-	}
-}
-
-/* Converts 1st MS VMM times to Heimtime. */
-void
-time_ms()
-{
-	size_t i;
-
-	for (i = 0; i < g_vmm_num; ++i) {
-		struct Vmm *vmm = &g_vmm_arr[i];
-		struct TsPair *ms;
-		struct TsPair const *ht0;
-		struct TsPair const *ht1;
-
-find_ms:
-		if (CIRC_GETNUM(vmm->ms_buf) == 0) {
-			continue;
-		}
-		CIRC_PEEK(ms, vmm->ms_buf, 0);
-		if (0 != ms->ht) {
-			/* Already converted, skip. */
-			continue;
-		}
-
-find_ht_span:
-		if (CIRC_GETNUM(vmm->ht_buf) < 2) {
-			/* We need at least 2 HT's to interpolate. */
-			continue;
-		}
-		CIRC_PEEK(ht0, vmm->ht_buf, 0);
-		if (SUBMOD(ht0->vmm_ts, ms->vmm_ts, 1 << 30) > 0) {
-			/* 1st HT is after 1st MS, problem! */
-			printf("1st MS before 1st HT, dropping MS!\n");
-			CIRC_DROP(vmm->ms_buf);
-			goto find_ms;
-		}
-		CIRC_PEEK(ht1, vmm->ht_buf, 1);
-		if (SUBMOD(ms->vmm_ts, ht1->vmm_ts, 1 << 30) >= 0) {
-			/* 1st MS after 2nd HT, drop 1st HT and retry. */
-			CIRC_DROP(vmm->ht_buf);
-			goto find_ht_span;
-		}
-
-		/* ht0 <= ms < ht1. */
-
-		ms->ht = (ms->vmm_ts - ht0->vmm_ts)
-		    * (ht1->ht - ht0->ht)
-		    / (ht1->vmm_ts - ht0->vmm_ts)
-		    + ht0->ht;
-		if (0) printf("%u: MS HT = %08x%08x\n",
-		    (unsigned)i,
-		    PF_TS(ms->ht));
-	}
-}
-
-int
-ms_coinc(void)
-{
-	uint64_t ht;
-	size_t i;
-
-	ht = 0;
-	for (i = 0; i < g_vmm_num; ++i) {
-		struct Vmm *vmm = &g_vmm_arr[i];
-		struct TsPair const *ms;
-
-		if (CIRC_GETNUM(vmm->ms_buf) == 0) {
-			/* VMM has no MS, cannot emit. */
-			return 0;
-		}
-		CIRC_PEEK(ms, vmm->ms_buf, 0);
-		if (0 == ms->ht) {
-			/* VMM has no time for MS, cannot emit. */
-			return 0;
-		}
-		if (0 == ht) {
-			ht = ms->ht;
-			continue;
-		}
-		if (fabs((double)(int64_t)(ms->ht - ht)) > MS_WINDOW_NS) {
-			/* MS's are not coincident, cannot emit. */
-			return 0;
-		}
-	}
-	if (0) printf("MS coinc!\n");
-	return 1;
-}
-
-int
-ms_timeout(void)
-{
-	size_t i;
-
-	for (i = 0; i < g_vmm_num; ++i) {
-		struct Vmm *vmm = &g_vmm_arr[i];
-		struct TsPair const *ms;
-		int64_t dt;
-
-		if (CIRC_GETNUM(vmm->ms_buf) == 0) {
-			continue;
-		}
-		CIRC_PEEK(ms, vmm->ms_buf, 0);
-		dt = SUBMOD(g_ts_latest, ms->vmm_ts, 1 << 30);
-		if (dt > MS_TIMEOUT_S / (TS2NS * 1e-9)) {
-			/* This VMM is timing out, emit. */
-			if (0) printf("MS timeout!\n");
-			return 1;
-		}
-	}
-	return 0;
-}
-
-struct TsPair const *
-earliest()
-{
-	struct TsPair const *earliest;
-	size_t i;
-
-	earliest = NULL;
-	for (i = 0; i < g_vmm_num; ++i) {
-		struct Vmm *vmm = &g_vmm_arr[i];
-		struct TsPair const *ms;
-
-		if (CIRC_GETNUM(vmm->ms_buf) == 0) {
-			continue;
-		}
-		CIRC_PEEK(ms, vmm->ms_buf, 0);
-		if (0 == ms->ht) {
-			continue;
-		}
-		if (!earliest || SUBMOD(earliest->ht, ms->ht, 1 << 30) > 0) {
-			earliest = ms;
-		}
-	}
-	return earliest;
-}
-
-/* Write event. */
-void
-emit(lwroc_pipe_buffer_consumer *pipe_buf, lwroc_data_pipe_handle
-    *data_handle)
-{
-	struct TsPair const *ms_earliest;
-	uint32_t *p32;
-	size_t i;
-	uint64_t ht, ts;
-	uint32_t header_size;
-	uint32_t wr_size;
-	uint32_t payload_size;
-	uint32_t write_size;
-	uint32_t sync_check;
-
-	/* Find earliest MS. */
-	ms_earliest = earliest();
-	if (!ms_earliest) {
-		return;
-	}
-	ht = ms_earliest->ht;
-	ts = ms_earliest->vmm_ts;
-
-	header_size = (sizeof (lmd_subevent_10_1_host) +
-	    sizeof (lmd_event_10_1_host));
-	wr_size = (5 + 1) * sizeof (uint32_t);
-	payload_size = 4;
-
-	write_size = header_size + wr_size + payload_size;
-
-	p32 = (void *)lwroc_request_event_space(data_handle, write_size);
-
-	ts = 123456;
-
-	p32[0] = (WR_ID << WHITE_RABBIT_STAMP_EBID_BRANCH_ID_SHIFT) &
-	    WHITE_RABBIT_STAMP_EBID_BRANCH_ID_MASK;
-	p32[1] = WHITE_RABBIT_STAMP_LL16_ID |
-	    (uint32_t)((ts >>  0) & 0xffff);
-	p32[2] = WHITE_RABBIT_STAMP_LH16_ID |
-	    (uint32_t)((ts >> 16) & 0xffff);
-	p32[3] = WHITE_RABBIT_STAMP_HL16_ID |
-	    (uint32_t)((ts >> 32) & 0xffff);
-	p32[4] = WHITE_RABBIT_STAMP_HH16_ID |
-	    (uint32_t)((ts >> 48) & 0xffff);
-
-	sync_check = 1000;
-
-	p32[5] = SYNC_CHECK_MAGIC | SYNC_CHECK_RECV |
-	    (sync_check & 0xffff);
-
-	p32 += wr_size / 4;
-
-
-	if (0)
-		printf("0x%08x%08x 0x%08x%08x\n", PF_TS(ts), PF_TS(ht));
-
-	/* Emit coincident MS's. */
-	for (i = 0; i < g_vmm_num; ++i) {
-		struct Vmm *vmm = &g_vmm_arr[i];
-		struct TsPair const *ms;
-
-		if (CIRC_GETNUM(vmm->ms_buf) == 0) {
-			continue;
-		}
-		CIRC_PEEK(ms, vmm->ms_buf, 0);
-		if (0 == ms->ht) {
-			continue;
-		}
-		if (fabs((double)(int64_t)(ms->ht - ht)) < MS_WINDOW_NS) {
-			uint64_t roi_left, roi_right;
-
-			roi_left = ms->vmm_ts + ROI_LEFT_TS;
-			roi_right = ms->vmm_ts + ROI_RIGHT_TS;
-
-			/* Emit hits! */
-			while (CIRC_GETNUM(vmm->hit_buf) > 0) {
-				struct Hit const *hit;
-
-				CIRC_PEEK(hit, vmm->hit_buf, 0);
-				if (SUBMOD(roi_left, hit->vmm_ts, 1 << 30) >
-				    0) {
-					/* Hit earlier than ROI, drop. */
-					CIRC_DROP(vmm->hit_buf);
-				} else if (SUBMOD(hit->vmm_ts, roi_right, 1 <<
-				    30) > 0) {
-					/* Hit later than ROI, done. */
-					break;
-				} else {
-					/* Emit hit! */
-					if (0) printf(" vmm=%u ch=%u ts=%08x%08x\n",
-					    (unsigned)i,
-					    hit->ch,
-					    PF_TS(hit->vmm_ts));
-					CIRC_DROP(vmm->hit_buf);
-				}
-			}
-			CIRC_DROP(vmm->ms_buf);
-			if (0) printf(" %u 0x%08x%08x 0x%08x%08x\n",
-			    (unsigned)i,
-			    PF_TS(ms->vmm_ts),
-			    PF_TS(ms->ht));
-		}
-	}
-
-	lwroc_used_event_space(data_handle, write_size, 0);
-
-	{
-		static unsigned msn = 0;
-		static double t_last = -1.0;
-		double t;
-
-		++msn;
-		t = time_get();
-		if (t_last < 0.0) {
-			t_last = t;
-		} else if (t_last + 0.1 < t) {
-			if (0) printf("MS = %u  /s = %f\n",
-			    msn, msn / (t - t_last));
-			msn = 0;
-			t_last = t;
-		}
-	}
-}
-#endif
 
 void
 roi(lwroc_pipe_buffer_consumer *pipe_buf, lwroc_data_pipe_handle *data_handle)
@@ -759,13 +462,14 @@ roi(lwroc_pipe_buffer_consumer *pipe_buf, lwroc_data_pipe_handle *data_handle)
 		void *p0;
 		lmd_event_10_1_host *ev;
 		lmd_subevent_10_1_host *sev;
-		uint32_t *p32;
+		uint32_t *p32, *p_vmm_n;
 		uint8_t *p8;
 		uint32_t header_size;
 		uint32_t wr_size;
 		uint32_t payload_size;
 		uint32_t write_size;
 		uint32_t sync_check;
+		uint32_t vmm_n;
 
 		/*
 		 * Peek at 1st MS and see if we have enough data to try to
@@ -808,10 +512,15 @@ roi(lwroc_pipe_buffer_consumer *pipe_buf, lwroc_data_pipe_handle *data_handle)
 		*p32++ = SYNC_CHECK_MAGIC | SYNC_CHECK_RECV |
 		    (sync_check & 0xffff);
 
+		p_vmm_n = p32++;
+		vmm_n = 0;
+
 		/* For each VMM with the MS, extract hits in ROI. */
 		while (g_ms_heap.num) {
 			struct HtMs ms;
 			struct Vmm *vmm;
+			uint32_t *p_hit_n;
+			uint32_t hit_n;
 
 			msp = &g_ms_heap.arr[0];
 			dht = msp->ht - ht0;
@@ -821,24 +530,38 @@ roi(lwroc_pipe_buffer_consumer *pipe_buf, lwroc_data_pipe_handle *data_handle)
 			HEAP_EXTRACT(g_ms_heap, ms, fail);
 
 			/* Write MS. */
-			*p32++ = 1;
+			*p32++ = vmm_n << 16 | ms.vmm_i;
+			*p32++ = (uint32_t)(ms.ht >> 32);
+			*p32++ = (uint32_t)ms.ht;
+			++vmm_n;
 
 			vmm = vmm_get(ms.vmm_i);
+
+			p_hit_n = p32++;
+			hit_n = 0;
 			while (vmm->hit_heap.num) {
 				struct HtHit const *hp;
 				struct HtHit hit;
 
 				hp = &vmm->hit_heap.arr[0];
 				if (ms.ht + ROI_RIGHT_US < hp->ht) {
+					/* Next hit outside ROI. */
 					break;
 				}
-				if (hp->ht + ROI_LEFT_US >= ms.ht) {
-					/* Write hit. */
-					*p32++ = 2;
-				}
 				HEAP_EXTRACT(vmm->hit_heap, hit, fail);
+				if (hit.ht + ROI_LEFT_US >= ms.ht) {
+					uint32_t dht;
+
+					/* Write hit. */
+					dht = 0x00ffffff & (hit.ht - ms.ht);
+					*p32++ = hit.ch << 24 | dht;
+					*p32++ = hit.adc << 16 | hit.tdc;
+					++hit_n;
+				}
 			}
+			*p_hit_n = hit_n;
 		}
+		*p_vmm_n = vmm_n;
 
 		ev->_header.l_dlen =
 		    ((uintptr_t)p32 - (uintptr_t)(&ev->_header + 1)) / 2;
@@ -872,6 +595,14 @@ raw2heap(void)
 		struct Vmm *vmm = &g_vmm_arr[vmm_i];
 		struct HtPair const *ht0;
 		struct HtPair const *ht1;
+		size_t n;
+
+		n = CIRC_GETNUM(vmm->ht_buf);
+		vmm->stats.ht_maxg = MAX(vmm->stats.ht_maxg, n);
+		vmm->stats.ht_maxl = MAX(vmm->stats.ht_maxl, n);
+		n = CIRC_GETNUM(vmm->ch_buf);
+		vmm->stats.ch_maxg = MAX(vmm->stats.ch_maxg, n);
+		vmm->stats.ch_maxl = MAX(vmm->stats.ch_maxl, n);
 
 find_ht_span:
 		if (CIRC_GETNUM(vmm->ht_buf) < 2) {
@@ -919,9 +650,15 @@ find_ht_span:
 			CIRC_DROP(vmm->ch_buf);
 			continue;
 fail:
-			fprintf(stderr, "Heap overflow, Heimtime missing?\n");
+			LWROC_ERROR("Heap overflow, Heimtime missing?");
 			CIRC_DROP(vmm->ch_buf);
 		}
+		g_ms_heap_maxg = MAX(g_ms_heap_maxg, g_ms_heap.num);
+		g_ms_heap_maxl = MAX(g_ms_heap_maxl, g_ms_heap.num);
+		vmm->stats.heap_maxg = MAX(vmm->stats.heap_maxg,
+		    vmm->hit_heap.num);
+		vmm->stats.heap_maxl = MAX(vmm->stats.heap_maxl,
+		    vmm->hit_heap.num);
 	}
 }
 
@@ -940,15 +677,24 @@ mon(void)
 	}
 	t_prev = t;
 
+	printf("MS heap max = %u/%u\n",
+	    (unsigned)g_ms_heap_maxl, (unsigned)g_ms_heap_maxg);
+	g_ms_heap_maxl = 0;
 	for (i = 0; i < g_vmm_num; ++i) {
 		struct Vmm *vmm = &g_vmm_arr[i];
 
-		printf("%u: #ht=%u #ch=%u\n",
+		printf("%u: #ht=%u/%u #ch=%u/%u #hp=%u/%u\n",
 			(unsigned)i,
-			(unsigned)((vmm->ht_buf.wr_i - vmm->ht_buf.rd_i) %
-			LENGTH(vmm->ht_buf.arr)),
-			(unsigned)((vmm->ch_buf.wr_i - vmm->ch_buf.rd_i) %
-			LENGTH(vmm->ch_buf.arr)));
+			(unsigned)vmm->stats.ht_maxl,
+			(unsigned)vmm->stats.ht_maxg,
+			(unsigned)vmm->stats.ch_maxl,
+			(unsigned)vmm->stats.ch_maxg,
+			(unsigned)vmm->stats.heap_maxl,
+			(unsigned)vmm->stats.heap_maxg
+			);
+		vmm->stats.ht_maxl = 0;
+		vmm->stats.ch_maxl = 0;
+		vmm->stats.heap_maxl = 0;
 	}
 }
 
@@ -1073,9 +819,9 @@ loop(lwroc_pipe_buffer_consumer *pipe_buf, const lwroc_thread_block
 				 */
 				frame = BUF_R32(0 * sizeof(uint32_t));
 				if (frame_had && frame_prev + 1 != frame) {
-					printf("Frame counter "
+					LWROC_ERROR_FMT("Frame counter "
 					    "mismatch (prev=0x%08x, "
-					    "curr=0x%08x)!\n",
+					    "curr=0x%08x)!",
 					    frame_prev, frame);
 				}
 				/* ts = BUF_R32(2 * sizeof(uint32_t)). */
@@ -1084,7 +830,8 @@ loop(lwroc_pipe_buffer_consumer *pipe_buf, const lwroc_thread_block
 				frame_prev = frame;
 
 				if (!is_sync) {
-					printf("Found data parsing sync.\n");
+					LWROC_INFO(
+					    "Found data parsing sync.");
 					is_sync = 1;
 				}
 
@@ -1107,7 +854,8 @@ loop(lwroc_pipe_buffer_consumer *pipe_buf, const lwroc_thread_block
 				}
 			} else {
 				if (is_sync) {
-					printf("Lost data parsing sync.\n");
+					LWROC_ERROR(
+					    "Lost data parsing sync.");
 					is_sync = 0;
 				}
 				++i;
@@ -1123,6 +871,8 @@ loop(lwroc_pipe_buffer_consumer *pipe_buf, const lwroc_thread_block
 		/* Move any remaining data to the pre-buf space. */
 		buf_bytes -= i;
 		memmove(buf, buf + i, buf_bytes);
+
+		mon();
 
 update_monitor:
 		LWROC_FILTER_MON_CHECK(LWROC_FILTER_USER, 0);
