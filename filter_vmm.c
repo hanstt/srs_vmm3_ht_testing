@@ -192,8 +192,8 @@ int
 is_ht_ch(unsigned a_vmm_i, unsigned a_ch_i)
 {
 	return
-	    (0 == a_vmm_i &&  3 == a_ch_i) /*||
-	    (1 == a_vmm_i && 37 == a_ch_i)*/;
+	    (0 == a_vmm_i &&  3 == a_ch_i) ||
+	    (1 == a_vmm_i && 37 == a_ch_i);
 }
 
 int
