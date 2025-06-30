@@ -15,13 +15,13 @@
 
 #define WR_ID 0x100
 
-#define ROI_LEFT_US -1.0
-#define ROI_RIGHT_US +1.0
+#define ROI_LEFT_US -10.0
+#define ROI_RIGHT_US +10.0
 
 #define MS_WINDOW_NS 100.0
 
 /* Wait this long until we start building events. */
-#define HT_DT_SAFE 1.0
+#define HT_DT_SAFE_S 1.0
 
 /*
  * VMM stuff.
@@ -60,8 +60,10 @@ static void roi(lwroc_pipe_buffer_consumer *, lwroc_data_pipe_handle *);
 
 #define TS2NS 22.5 /* (5.24288 / 0.233045) */
 
-#define ROI_LEFT_TS (1e3 * ROI_LEFT_US / TS2NS)
-#define ROI_RIGHT_TS (1e3 * ROI_RIGHT_US / TS2NS)
+#define ROI_LEFT_TS (1e2 * ROI_LEFT_US)
+#define ROI_RIGHT_TS (1e2 * ROI_RIGHT_US)
+
+#define MS_WINDOW_TS (0.1 * MS_WINDOW_NS)
 
 #define LENGTH(x) (sizeof x / sizeof *x)
 #define MAX(a, b) ((a) > (b) ? (a) : (b))
@@ -531,7 +533,7 @@ roi(lwroc_pipe_buffer_consumer *pipe_buf, lwroc_data_pipe_handle *data_handle)
 		msp = &g_ms_heap.arr[0];
 		ht0 = msp->ht;
 		dht = g_ht_latest - ht0;
-		if (dht < HT_DT_SAFE) {
+		if (dht < HT_DT_SAFE_S) {
 			break;
 		}
 
@@ -578,7 +580,7 @@ roi(lwroc_pipe_buffer_consumer *pipe_buf, lwroc_data_pipe_handle *data_handle)
 
 			msp = &g_ms_heap.arr[0];
 			dht = msp->ht - ht0;
-			if (dht > MS_WINDOW_NS) {
+			if (dht > MS_WINDOW_TS) {
 				break;
 			}
 			HEAP_EXTRACT(g_ms_heap, ms, fail);
@@ -599,16 +601,17 @@ roi(lwroc_pipe_buffer_consumer *pipe_buf, lwroc_data_pipe_handle *data_handle)
 				struct HtHit hit;
 
 				hp = &vmm->hit_heap.arr[0];
-				if (ms.ht + ROI_RIGHT_US < hp->ht) {
+				if (ms.ht + ROI_RIGHT_TS < hp->ht) {
 					/* Next hit outside ROI. */
 					break;
 				}
 				HEAP_EXTRACT(vmm->hit_heap, hit, fail);
-				if (hit.ht + ROI_LEFT_US >= ms.ht) {
+				if (ms.ht + ROI_LEFT_TS < hit.ht) {
 					uint32_t dht;
 
 					/* Write hit. */
-					dht = 0x00ffffff & (hit.ht - ms.ht);
+					dht = 0x00ffffff &
+					    (hit.ht - ms.ht + (1 << 23));
 					*p32++ = hit.ch << 24 | dht;
 					*p32++ = hit.adc << 16 | hit.tdc;
 					++hit_n;
