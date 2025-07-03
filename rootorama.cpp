@@ -30,6 +30,7 @@ static uint32_t g_marker;
 static uint32_t g_marker_vmm;
 static uint64_t g_marker_ts;
 static uint32_t g_hit;
+static uint32_t g_hit_fec;
 static uint32_t g_hit_ofs;
 static int g_hit_ofs_signed;
 static uint32_t g_hit_vmm;
@@ -186,6 +187,7 @@ main(int argc, char **argv)
   tree->Branch("marker_vmm", &g_marker_vmm, "marker_vmm[marker]/i");
   tree->Branch("marker_ts",  &g_marker_ts,  "marker_ts[marker]/l");
   tree->Branch("hit",        &g_hit,        "hit/i");
+  tree->Branch("hit_fec",    &g_hit_fec,    "hit_fec[hit]/i");
   tree->Branch("hit_ofs",    &g_hit_ofs_signed,    "hit_ofs[hit]/I");
   tree->Branch("hit_vmm",    &g_hit_vmm,    "hit_vmm[hit]/i");
   tree->Branch("hit_adc",    &g_hit_adc,    "hit_adc[hit]/i");
@@ -238,6 +240,7 @@ main(int argc, char **argv)
         uint32_t frame;
 
         /* Looks like a header. */
+        g_hit_fec = id & 0xff;
         frame = BUF_R32(has_size * sizeof(uint32_t));
         if (0xffffffff != frame_prev &&
             frame_prev + 1 != frame) {
