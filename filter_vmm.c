@@ -23,9 +23,17 @@
 /* Wait this long until we start building events. */
 #define HT_DT_SAFE 1.0
 
+/*
+ * VMM stuff.
+ * There are two kinds of timestamps:
+ *  ht = Heimtime
+ *  ts = VMM
+ */
+
 static uint32_t g_evtcnt;
 
 struct HtMs {
+	uint16_t	fec_i;
 	uint16_t	vmm_i;
 	uint64_t	ht;
 	uint16_t	adc;
@@ -50,13 +58,6 @@ static void process_marker(uint32_t, uint16_t);
 static void raw2heap(void);
 static void roi(lwroc_pipe_buffer_consumer *, lwroc_data_pipe_handle *);
 
-/*
- * VMM stuff.
- * There are two kinds of timestamps:
- *  ht = Heimtime
- *  ts = VMM
- */
-
 #define TS2NS 22.5 /* (5.24288 / 0.233045) */
 
 #define ROI_LEFT_TS (1e3 * ROI_LEFT_US / TS2NS)
@@ -74,13 +75,20 @@ static void roi(lwroc_pipe_buffer_consumer *, lwroc_data_pipe_handle *);
 /* Circular buffer code. */
 
 /* wr == rd -> empty, wr+1 == rd -> full. */
-#define CIRC_DECL(Type, N) struct { \
+#define CIRC_DECL(Type) struct { \
+	size_t	num; \
 	size_t	rd_i; \
 	size_t	wr_i; \
-	struct	Type arr[N]; \
+	struct	Type *arr; \
 }
-#define CIRC_GETNUM(circ) ((circ.wr_i - circ.rd_i) % LENGTH(circ.arr))
-#define CIRC_STEP(circ, idx, ofs) ((circ.idx + ofs) & (LENGTH(circ.arr) - 1))
+#define CIRC_GETNUM(circ) ((circ.wr_i - circ.rd_i) % circ.num)
+#define CIRC_INIT(circ, N) do { \
+	circ.num = N; \
+	circ.rd_i = 0; \
+	circ.wr_i = 0; \
+	circ.arr = calloc(N, sizeof *circ.arr); \
+} while (0)
+#define CIRC_STEP(circ, idx, ofs) ((circ.idx + ofs) & (circ.num - 1))
 #define CIRC_PEEK(ptr, circ, ofs) do { \
 	size_t i_; \
 	assert(CIRC_GETNUM(circ) > 0); \
@@ -90,7 +98,7 @@ static void roi(lwroc_pipe_buffer_consumer *, lwroc_data_pipe_handle *);
 #define CIRC_PEEK_REV(ptr, circ, ofs) do { \
 	size_t i_; \
 	assert(CIRC_GETNUM(circ) > 0); \
-	i_ = CIRC_STEP(circ, wr_i, LENGTH(circ.arr) - ofs - 1); \
+	i_ = CIRC_STEP(circ, wr_i, circ.num - ofs - 1); \
 	ptr = &circ.arr[i_]; \
 } while (0)
 #define CIRC_DROP(circ) do { \
@@ -111,7 +119,7 @@ static void roi(lwroc_pipe_buffer_consumer *, lwroc_data_pipe_handle *);
 } while (0)
 #define CIRC_FOREACH(idx, circ) \
     for (idx = circ.rd_i; idx != circ.wr_i; \
-	idx = (idx + 1) & (LENGTH(circ.arr) - 1))
+	idx = (idx + 1) & (circ.num - 1))
 
 struct HtPair {
 	uint64_t	ht;
@@ -147,9 +155,9 @@ struct Vmm {
 		} ht;
 	} ht_build;
 	/* 256 * 5.24 ms ~= 1.3 s. */
-	CIRC_DECL(HtPair, 256) ht_buf;
+	CIRC_DECL(HtPair) ht_buf;
 	/* 1<<17 / 1.3 s ~= 100 kHz. */
-	CIRC_DECL(VmmChannel, 1 << 17) ch_buf;
+	CIRC_DECL(VmmChannel) ch_buf;
 	struct	HeapHit hit_heap;
 	struct {
 		size_t	ht_maxg;
@@ -160,10 +168,15 @@ struct Vmm {
 		size_t	heap_maxl;
 	} stats;
 };
+struct Fec {
+	size_t	vmm_num;
+	struct	Vmm *vmm_arr;
+};
 
 static uint64_t	g_ht_latest;
-static struct Vmm *g_vmm_arr;
-static size_t g_vmm_num;
+static struct Fec *g_fec_arr;
+static size_t g_fec_num;
+static uint32_t g_fec_i;
 
 double
 time_get(void)
@@ -217,10 +230,34 @@ cmp_hit(struct HtHit const *a_l, struct HtHit const *a_r)
 	return a_l->ht < a_r->ht;
 }
 
-struct Vmm *
-vmm_get(unsigned a_i)
+struct Fec *
+fec_get(unsigned a_i)
 {
-	if (a_i >= g_vmm_num) {
+	if (a_i >= g_fec_num) {
+		struct Fec *arr;
+		unsigned i, num;
+
+		num = a_i + 1;
+		arr = calloc(num, sizeof *arr);
+		if (!arr) {
+			err(EXIT_FAILURE, "calloc");
+		}
+		memcpy(arr, g_fec_arr, g_fec_num * sizeof *arr);
+		free(g_fec_arr);
+		g_fec_arr = arr;
+		g_fec_num = num;
+	}
+	return &g_fec_arr[a_i];
+fail:
+	err(EXIT_FAILURE, "Hit heap init failed");
+}
+
+struct Vmm *
+vmm_get(struct Fec *a_fec, unsigned a_i)
+{
+	struct Vmm *vmm;
+
+	if (a_i >= a_fec->vmm_num) {
 		struct Vmm *arr;
 		unsigned i, num;
 
@@ -229,15 +266,20 @@ vmm_get(unsigned a_i)
 		if (!arr) {
 			err(EXIT_FAILURE, "calloc");
 		}
-		memcpy(arr, g_vmm_arr, g_vmm_num * sizeof *arr);
-		free(g_vmm_arr);
-		for (i = g_vmm_num; i < num; ++i) {
+		memcpy(arr, a_fec->vmm_arr, a_fec->vmm_num * sizeof *arr);
+		free(a_fec->vmm_arr);
+		for (i = a_fec->vmm_num; i < num; ++i) {
 			HEAP_INIT(arr[i].hit_heap, cmp_hit, 1 << 17, fail);
 		}
-		g_vmm_arr = arr;
-		g_vmm_num = num;
+		a_fec->vmm_arr = arr;
+		a_fec->vmm_num = num;
 	}
-	return &g_vmm_arr[a_i];
+	vmm = &a_fec->vmm_arr[a_i];
+	if (!vmm->ht_buf.arr) {
+		CIRC_INIT(vmm->ht_buf, 256);
+		CIRC_INIT(vmm->ch_buf, 1 << 17);
+	}
+	return vmm;
 fail:
 	err(EXIT_FAILURE, "Hit heap init failed");
 }
@@ -246,7 +288,8 @@ void
 process_ht(unsigned a_vmm_i, unsigned a_ch_i, uint32_t a_ts_curr)
 {
 	uint32_t dt_arr[3];
-	struct Vmm *vmm = vmm_get(a_vmm_i);
+	struct Fec *fec = fec_get(g_fec_i);
+	struct Vmm *vmm = vmm_get(fec, a_vmm_i);
 	struct HtPair *pair;
 	size_t i;
 	unsigned bit_ts;
@@ -262,8 +305,8 @@ process_ht(unsigned a_vmm_i, unsigned a_ch_i, uint32_t a_ts_curr)
 		dt_arr[i] =
 		    vmm->ht_build.history[i + 1] - vmm->ht_build.history[i];
 	}
-if(0)LWROC_INFO_FMT("%u %2u  %6.3f,%6.3f,%6.3f.",
-	a_vmm_i, a_ch_i,
+if(0)LWROC_INFO_FMT("%2u %2u %2u  %6.3f,%6.3f,%6.3f.",
+	g_fec_i, a_vmm_i, a_ch_i,
 	1e-6 * TS2NS * dt_arr[0],
 	1e-6 * TS2NS * dt_arr[1],
 	1e-6 * TS2NS * dt_arr[2]);
@@ -279,7 +322,7 @@ if(0)LWROC_INFO_FMT("%u %2u  %6.3f,%6.3f,%6.3f.",
 		      HT_APPROX(dt_arr[2], HT_P))) {
 			return;
 		}
-		LWROC_INFO("Found HT carry.");
+		LWROC_INFO_FMT("%2u:%2u: Found HT carry.", g_fec_i, a_vmm_i);
 		vmm->ht_build.has_carry = 1;
 		do_clear = 1;
 	}
@@ -292,7 +335,8 @@ if(0)LWROC_INFO_FMT("%u %2u  %6.3f,%6.3f,%6.3f.",
 		do_inc = 2;
 		do_clear = 1;
 	} else if (dt_arr[0] > 2.5*HT_P) {
-		LWROC_ERROR("Lost HT carry signal.");
+		LWROC_ERROR_FMT("%2u:%2u: Lost HT carry signal.",
+		    g_fec_i, a_vmm_i);
 		vmm->ht_build.has_carry = 0;
 		return;
 	}
@@ -349,26 +393,27 @@ if(0)LWROC_INFO_FMT("%u %2u  %6.3f,%6.3f,%6.3f.",
 				    "vmm=%u: Heimtime expected=%08x "
 				    "but got=%08x!",
 				    a_vmm_i,
-				    vmm->ht_build.ht.ht >> 24,
+				    (uint32_t)(vmm->ht_build.ht.ht >> 24),
 				    vmm->ht_build.mask);
 			} else if (vmm->ht_build.ht.ht > ht) {
 				LWROC_ERROR_FMT(
 				    "vmm=%u: Heimtime reversed %08x -> %08x!",
 				    a_vmm_i,
-				    vmm->ht_build.ht.ht >> 24,
+				    (uint32_t)(vmm->ht_build.ht.ht >> 24),
 				    vmm->ht_build.mask);
 			}
 		} else {
-			LWROC_INFO_FMT("Found HT=0x%08x.",
+			LWROC_INFO_FMT("%2u:%2u: Found HT=0x%08x.",
+			    g_fec_i, a_vmm_i,
 			    vmm->ht_build.mask);
 		}
 		do_clear = 1;
 		vmm->ht_build.ht.has = 1;
 		vmm->ht_build.ht.ht = ht;
 		if (0)
-			LWROC_INFO_FMT("vmm=%u: HT = %08x.",
-			    a_vmm_i,
-			    vmm->ht_build.ht);
+			LWROC_INFO_FMT("%2u:%2u: HT = %08x.",
+			    g_fec_i, a_vmm_i,
+			    (uint32_t)vmm->ht_build.mask);
 	}
 	if (do_clear) {
 		vmm->ht_build.bit_i = 0;
@@ -387,6 +432,7 @@ process_hit(uint32_t a_u32, uint16_t a_u16)
 	uint32_t ch_i = 0x3f & (a_u16 >> 8);
 	uint32_t tdc = 0xff & a_u16;
 
+	struct Fec *fec;
 	struct Vmm *vmm;
 	uint64_t ts;
 
@@ -401,16 +447,19 @@ process_hit(uint32_t a_u32, uint16_t a_u16)
 	}
 
 	if (0)
-		LWROC_INFO_FMT("vmm=%2u  "
+		LWROC_INFO_FMT("Hit fec=%2u  "
+		    "vmm=%2u  "
 		    "ch=%2u  "
 		    "a/t=%4u/%4u  "
 		    "ofs/bcid=%3d/%4u.",
+		    g_fec_i,
 		    vmm_i,
 		    ch_i,
 		    adc, tdc,
 		    ofs, bcid);
 
-	vmm = vmm_get(vmm_i);
+	fec = fec_get(g_fec_i);
+	vmm = vmm_get(fec, vmm_i);
 	ts = vmm->ts_marker + (ofs * 4096) + bcid;
 	if (0)
 		LWROC_INFO_FMT("%08x%08x.", PF_TS(ts));
@@ -438,17 +487,20 @@ process_marker(uint32_t a_u32, uint16_t a_u16)
 	uint64_t ts_hi = a_u32;
 	uint64_t ts = ts_hi << 10 | ts_lo;
 
+	struct Fec *fec;
 	struct Vmm *vmm;
 
 	if (0)
-		LWROC_INFO_FMT("Marker vmm=%2u  "
+		LWROC_INFO_FMT("Marker fec=%2u vmm=%2u  "
 		    "%08x:%04x  "
 		    "ts=0x%08x%08x.",
+		    g_fec_i,
 		    vmm_i,
 		    a_u32, a_u16,
 		    PF_TS(ts));
 
-	vmm = vmm_get(vmm_i);
+	fec = fec_get(g_fec_i);
+	vmm = vmm_get(fec, vmm_i);
 	vmm->ts_marker = ts;
 }
 
@@ -519,6 +571,7 @@ roi(lwroc_pipe_buffer_consumer *pipe_buf, lwroc_data_pipe_handle *data_handle)
 		/* For each VMM with the MS, extract hits in ROI. */
 		while (g_ms_heap.num) {
 			struct HtMs ms;
+			struct Fec *fec;
 			struct Vmm *vmm;
 			uint32_t *p_hit_n;
 			uint32_t hit_n;
@@ -536,7 +589,8 @@ roi(lwroc_pipe_buffer_consumer *pipe_buf, lwroc_data_pipe_handle *data_handle)
 			*p32++ = (uint32_t)ms.ht;
 			++vmm_n;
 
-			vmm = vmm_get(ms.vmm_i);
+			fec = fec_get(ms.fec_i);
+			vmm = vmm_get(fec, ms.vmm_i);
 
 			p_hit_n = p32++;
 			hit_n = 0;
@@ -590,77 +644,84 @@ fail:
 void
 raw2heap(void)
 {
-	size_t vmm_i;
+	unsigned fec_i, vmm_i;
 
-	for (vmm_i = 0; vmm_i < g_vmm_num; ++vmm_i) {
-		struct Vmm *vmm = &g_vmm_arr[vmm_i];
-		struct HtPair const *ht0;
-		struct HtPair const *ht1;
-		size_t n;
+	for (fec_i = 0; fec_i < g_fec_num; ++fec_i) {
+		struct Fec *fec = fec_get(fec_i);
 
-		n = CIRC_GETNUM(vmm->ht_buf);
-		vmm->stats.ht_maxg = MAX(vmm->stats.ht_maxg, n);
-		vmm->stats.ht_maxl = MAX(vmm->stats.ht_maxl, n);
-		n = CIRC_GETNUM(vmm->ch_buf);
-		vmm->stats.ch_maxg = MAX(vmm->stats.ch_maxg, n);
-		vmm->stats.ch_maxl = MAX(vmm->stats.ch_maxl, n);
+		for (vmm_i = 0; vmm_i < fec->vmm_num; ++vmm_i) {
+			struct Vmm *vmm = vmm_get(fec, vmm_i);
+			struct HtPair const *ht0;
+			struct HtPair const *ht1;
+			size_t n;
+
+			n = CIRC_GETNUM(vmm->ht_buf);
+			vmm->stats.ht_maxg = MAX(vmm->stats.ht_maxg, n);
+			vmm->stats.ht_maxl = MAX(vmm->stats.ht_maxl, n);
+			n = CIRC_GETNUM(vmm->ch_buf);
+			vmm->stats.ch_maxg = MAX(vmm->stats.ch_maxg, n);
+			vmm->stats.ch_maxl = MAX(vmm->stats.ch_maxl, n);
 
 find_ht_span:
-		if (CIRC_GETNUM(vmm->ht_buf) < 2) {
-			/* We need at least 2 HT's to interpolate. */
-			continue;
-		}
-		CIRC_PEEK(ht0, vmm->ht_buf, 0);
-		CIRC_PEEK(ht1, vmm->ht_buf, 1);
-
-		while (CIRC_GETNUM(vmm->ch_buf)) {
-			struct VmmChannel *ch;
-			uint64_t ht;
-
-			CIRC_PEEK(ch, vmm->ch_buf, 0);
-			if (SUBMOD(ht0->ts, ch->ts, 1 << 30) > 0) {
-				/* Hit before 1st HT, drop hit. */
-				CIRC_DROP(vmm->ch_buf);
+			if (CIRC_GETNUM(vmm->ht_buf) < 2) {
+				/* We need at least 2 HT's to interpolate. */
 				continue;
 			}
-			if (SUBMOD(ch->ts, ht1->ts, 1 << 30) > 0) {
-				/* Hit after 2nd HT, drop HT. */
-				CIRC_DROP(vmm->ht_buf);
-				goto find_ht_span;
-			}
-			ht = (ch->ts - ht0->ts)
-			    * (ht1->ht - ht0->ht)
-			    / (ht1->ts - ht0->ts)
-			    + ht0->ht;
-			g_ht_latest = MAX(g_ht_latest, ht);
-			if (is_ms_ch(vmm_i, ch->ch)) {
-				struct HtMs ms;
+			CIRC_PEEK(ht0, vmm->ht_buf, 0);
+			CIRC_PEEK(ht1, vmm->ht_buf, 1);
 
-				ms.vmm_i = vmm_i;
-				ms.ht = ht;
-				ms.adc = ch->adc;
-				HEAP_INSERT(g_ms_heap, ms, fail);
-			} else {
-				struct HtHit hit;
+			while (CIRC_GETNUM(vmm->ch_buf)) {
+				struct VmmChannel *ch;
+				uint64_t ht;
 
-				hit.ch = ch->ch;
-				hit.ht = ht;
-				hit.adc = ch->adc;
-				hit.tdc = ch->tdc;
-				HEAP_INSERT(vmm->hit_heap, hit, fail);
-			}
-			CIRC_DROP(vmm->ch_buf);
-			continue;
+				CIRC_PEEK(ch, vmm->ch_buf, 0);
+				if (SUBMOD(ht0->ts, ch->ts, 1 << 30) > 0) {
+					/* Hit before 1st HT, drop hit. */
+					CIRC_DROP(vmm->ch_buf);
+					continue;
+				}
+				if (SUBMOD(ch->ts, ht1->ts, 1 << 30) > 0) {
+					/* Hit after 2nd HT, drop HT. */
+					CIRC_DROP(vmm->ht_buf);
+					goto find_ht_span;
+				}
+				ht = (ch->ts - ht0->ts)
+				    * (ht1->ht - ht0->ht)
+				    / (ht1->ts - ht0->ts)
+				    + ht0->ht;
+				g_ht_latest = MAX(g_ht_latest, ht);
+				if (is_ms_ch(vmm_i, ch->ch)) {
+					struct HtMs ms;
+
+					ms.fec_i = fec_i;
+					ms.vmm_i = vmm_i;
+					ms.ht = ht;
+					ms.adc = ch->adc;
+					HEAP_INSERT(g_ms_heap, ms, fail);
+				} else {
+					struct HtHit hit;
+
+					hit.ch = ch->ch;
+					hit.ht = ht;
+					hit.adc = ch->adc;
+					hit.tdc = ch->tdc;
+					HEAP_INSERT(vmm->hit_heap, hit, fail);
+				}
+				CIRC_DROP(vmm->ch_buf);
+				continue;
 fail:
-			LWROC_ERROR("Heap overflow, Heimtime missing?");
-			CIRC_DROP(vmm->ch_buf);
+				LWROC_ERROR_FMT(
+				    "%2u:%2u: Heap overflow, "
+				    "Heimtime missing?", fec_i, vmm_i);
+				CIRC_DROP(vmm->ch_buf);
+			}
+			g_ms_heap_maxg = MAX(g_ms_heap_maxg, g_ms_heap.num);
+			g_ms_heap_maxl = MAX(g_ms_heap_maxl, g_ms_heap.num);
+			vmm->stats.heap_maxg = MAX(vmm->stats.heap_maxg,
+			    vmm->hit_heap.num);
+			vmm->stats.heap_maxl = MAX(vmm->stats.heap_maxl,
+			    vmm->hit_heap.num);
 		}
-		g_ms_heap_maxg = MAX(g_ms_heap_maxg, g_ms_heap.num);
-		g_ms_heap_maxl = MAX(g_ms_heap_maxl, g_ms_heap.num);
-		vmm->stats.heap_maxg = MAX(vmm->stats.heap_maxg,
-		    vmm->hit_heap.num);
-		vmm->stats.heap_maxl = MAX(vmm->stats.heap_maxl,
-		    vmm->hit_heap.num);
 	}
 }
 
@@ -669,7 +730,7 @@ mon(void)
 {
 	static double t_prev = -1.0;
 	double t = time_get();
-	size_t i;
+	size_t fec_i, vmm_i;
 
 	if (t_prev < 0.0) {
 		t_prev = t;
@@ -682,21 +743,26 @@ mon(void)
 	printf("MS heap max = %u/%u\n",
 	    (unsigned)g_ms_heap_maxl, (unsigned)g_ms_heap_maxg);
 	g_ms_heap_maxl = 0;
-	for (i = 0; i < g_vmm_num; ++i) {
-		struct Vmm *vmm = &g_vmm_arr[i];
+	for (fec_i = 0; fec_i < g_fec_num; ++fec_i) {
+		struct Fec *fec = fec_get(fec_i);
 
-		printf("%u: #ht=%u/%u #ch=%u/%u #hp=%u/%u\n",
-			(unsigned)i,
-			(unsigned)vmm->stats.ht_maxl,
-			(unsigned)vmm->stats.ht_maxg,
-			(unsigned)vmm->stats.ch_maxl,
-			(unsigned)vmm->stats.ch_maxg,
-			(unsigned)vmm->stats.heap_maxl,
-			(unsigned)vmm->stats.heap_maxg
-			);
-		vmm->stats.ht_maxl = 0;
-		vmm->stats.ch_maxl = 0;
-		vmm->stats.heap_maxl = 0;
+		for (vmm_i = 0; vmm_i < fec->vmm_num; ++vmm_i) {
+			struct Vmm *vmm = vmm_get(fec, vmm_i);
+
+			printf("%2u:%2u: #ht=%u/%u #ch=%u/%u #hp=%u/%u\n",
+			    (unsigned)fec_i,
+			    (unsigned)vmm_i,
+			    (unsigned)vmm->stats.ht_maxl,
+			    (unsigned)vmm->stats.ht_maxg,
+			    (unsigned)vmm->stats.ch_maxl,
+			    (unsigned)vmm->stats.ch_maxg,
+			    (unsigned)vmm->stats.heap_maxl,
+			    (unsigned)vmm->stats.heap_maxg
+			    );
+			vmm->stats.ht_maxl = 0;
+			vmm->stats.ch_maxl = 0;
+			vmm->stats.heap_maxl = 0;
+		}
 	}
 }
 
@@ -792,8 +858,8 @@ loop(lwroc_pipe_buffer_consumer *pipe_buf, const lwroc_thread_block
 
 			snprintf(tmp, sizeof tmp,
 			    "Chunk bytes (4+%u) != sub-event bytes (%u).",
-			    chunk_bytes, subev_data._size);
-			LWROC_FATAL(tmp);
+			    chunk_bytes, (unsigned)subev_data._size);
+			LWROC_FATAL_FMT("%s", tmp);
 		}
 		srcp += 4;
 		memcpy(buf + buf_bytes, srcp, chunk_bytes);
@@ -819,6 +885,7 @@ loop(lwroc_pipe_buffer_consumer *pipe_buf, const lwroc_thread_block
 				 *  32-bit udp timestamp.
 				 *  32-bit offset overflow.
 				 */
+				g_fec_i = id & 0xff;
 				frame = BUF_R32(0 * sizeof(uint32_t));
 				if (frame_had && frame_prev + 1 != frame) {
 					LWROC_ERROR_FMT("Frame counter "
