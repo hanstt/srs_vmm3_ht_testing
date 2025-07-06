@@ -31,7 +31,7 @@ $(ROOTORAMA): rootorama.o
 $(FILTER_VMM): filter_vmm.o
 	$(CC) $(LDFLAGS) -o $@ $< $(shell CC=gcc $(DRASI_CONFIG) --merge --libs)
 
-test.o rootorama.o: $(UNGRAY_TABLE)
+test.o rootorama.o filter_vmm.o: $(UNGRAY_TABLE)
 
 $(UNGRAY_TABLE): $(UNGRAY)
 	./$< > $@.tmp
