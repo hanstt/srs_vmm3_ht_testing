@@ -1,7 +1,7 @@
 CC:=gcc
 DRASI_CONFIG:=../drasi/bin/drasi-config.sh
 
-FUSER:=fuser
+FUSER:=f_user
 GEN:=gen
 TEST:=test
 ROOTORAMA:=rootorama
@@ -14,10 +14,7 @@ ROOT_CFLAGS:=$(shell root-config --cflags)
 LDFLAGS:=
 ROOT_LIBS:=$(shell root-config --libs)
 
-all: $(GEN) $(TEST) $(ROOTORAMA) $(FILTER_VMM) heaptest
-
-$(FUSER): fuser.o
-	$(CC) $(LDFLAGS) -o $@ $<
+all: $(GEN) $(TEST) $(ROOTORAMA) $(FILTER_VMM) $(FUSER) heaptest
 
 $(GEN): gen.o
 	$(CC) $(LDFLAGS) -o $@ $<
@@ -30,6 +27,9 @@ $(ROOTORAMA): rootorama.o
 
 $(FILTER_VMM): filter_vmm.o
 	$(CC) $(LDFLAGS) -o $@ $< $(shell CC=gcc $(DRASI_CONFIG) --merge --libs)
+
+$(FUSER): f_user.o
+	$(CC) $(LDFLAGS) -o $@ $< $(shell CC=gcc $(DRASI_CONFIG) --libs)
 
 test.o rootorama.o filter_vmm.o: $(UNGRAY_TABLE)
 
@@ -51,6 +51,9 @@ heaptest.o: heap.h
 	$(CXX) $(CFLAGS) $(ROOT_CFLAGS) -c -o $@ $<
 
 filter_vmm.o: filter_vmm.c Makefile
+	$(CC) $(CFLAGS) $(shell CC=gcc $(DRASI_CONFIG) --cflags) -c -o $@ $<
+
+f_user.o: f_user.c Makefile
 	$(CC) $(CFLAGS) $(shell CC=gcc $(DRASI_CONFIG) --cflags) -c -o $@ $<
 
 clean:
