@@ -743,8 +743,10 @@ mon(void)
 	}
 	t_prev = t;
 
-	printf("MS heap max = %u/%u\n",
-	    (unsigned)g_ms_heap_maxl, (unsigned)g_ms_heap_maxg);
+	printf("MS-heap = %u/%u/%u\n",
+	    (unsigned)g_ms_heap_maxl,
+	    (unsigned)g_ms_heap_maxg,
+	    (unsigned)g_ms_heap.num);
 	g_ms_heap_maxl = 0;
 	for (fec_i = 0; fec_i < g_fec_num; ++fec_i) {
 		struct Fec *fec = fec_get(fec_i);
@@ -752,15 +754,21 @@ mon(void)
 		for (vmm_i = 0; vmm_i < fec->vmm_num; ++vmm_i) {
 			struct Vmm *vmm = vmm_get(fec, vmm_i);
 
-			printf("%2u:%2u: #ht=%u/%u #ch=%u/%u #hp=%u/%u\n",
+			printf("%2u:%2u: "
+			    "#HT=%u/%u/%u "
+			    "#MS+hit=%u/%u/%u "
+			    "#hit-heap=%u/%u/%u\n",
 			    (unsigned)fec_i,
 			    (unsigned)vmm_i,
 			    (unsigned)vmm->stats.ht_maxl,
 			    (unsigned)vmm->stats.ht_maxg,
+			    (unsigned)vmm->ht_buf.num,
 			    (unsigned)vmm->stats.ch_maxl,
 			    (unsigned)vmm->stats.ch_maxg,
+			    (unsigned)vmm->ch_buf.num,
 			    (unsigned)vmm->stats.heap_maxl,
-			    (unsigned)vmm->stats.heap_maxg
+			    (unsigned)vmm->stats.heap_maxg,
+			    (unsigned)vmm->hit_heap.capacity
 			    );
 			vmm->stats.ht_maxl = 0;
 			vmm->stats.ch_maxl = 0;
