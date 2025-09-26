@@ -6,6 +6,6 @@
 	--drasi=localhost \
 	--merge-mode=event \
 	--merge-no-validate \
-	--buf=size=100Mi \
-	--max-ev-size=0x10000 \
+	--buf=size=1Gi \
+	--max-ev-size=0x100000 \
 	--server=stream:8001
