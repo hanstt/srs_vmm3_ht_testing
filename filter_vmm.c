@@ -541,7 +541,7 @@ roi(lwroc_pipe_buffer_consumer *pipe_buf, lwroc_data_pipe_handle *data_handle)
 
 		header_size = sizeof ev + sizeof sev;
 		wr_size = (1 + 4 + 1) * sizeof (uint32_t);
-		payload_size = 0x10000;
+		payload_size = 0x100000;
 
 		write_size = header_size + wr_size + payload_size;
 
@@ -755,9 +755,9 @@ mon(void)
 			struct Vmm *vmm = vmm_get(fec, vmm_i);
 
 			printf("%2u:%2u: "
-			    "#HT=%u/%u/%u "
-			    "#MS+hit=%u/%u/%u "
-			    "#hit-heap=%u/%u/%u\n",
+			    "#HT=%3u/%3u/%3u "
+			    "#MS+hit=%6u/%6u/%6u "
+			    "#hit-heap=%6u/%6u/%6u\n",
 			    (unsigned)fec_i,
 			    (unsigned)vmm_i,
 			    (unsigned)vmm->stats.ht_maxl,
@@ -803,7 +803,7 @@ loop(lwroc_pipe_buffer_consumer *pipe_buf, const lwroc_thread_block
 	char buf[1 << 16];
 	size_t buf_bytes = 0;
 	int frame_had = 0;
-	uint32_t frame_prev;
+	uint32_t frame_prev[16];
 	int is_sync = 0;
 
 	for (;;) {
@@ -896,18 +896,20 @@ loop(lwroc_pipe_buffer_consumer *pipe_buf, const lwroc_thread_block
 				 *  32-bit udp timestamp.
 				 *  32-bit offset overflow.
 				 */
-				g_fec_i = id & 0xff;
+				g_fec_i = (id & 0xff) >> 4;
 				frame = BUF_R32(0 * sizeof(uint32_t));
-				if (frame_had && frame_prev + 1 != frame) {
-					LWROC_ERROR_FMT("Frame counter "
-					    "mismatch (prev=0x%08x, "
-					    "curr=0x%08x)!",
-					    frame_prev, frame);
+				if (frame_had && frame_prev[g_fec_i] + 1 !=
+				    frame) {
+					LWROC_ERROR_FMT("FEC=%u "
+					    "frame counter mismatch "
+					    "(prev=0x%08x, curr=0x%08x)!",
+					    g_fec_i, frame_prev[g_fec_i],
+					    frame);
 				}
 				/* ts = BUF_R32(2 * sizeof(uint32_t)). */
 				/* of = BUF_R32(3 * sizeof(uint32_t)). */
 				frame_had = 1;
-				frame_prev = frame;
+				frame_prev[g_fec_i] = frame;
 
 				if (!is_sync) {
 					LWROC_INFO(
