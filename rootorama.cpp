@@ -3,6 +3,7 @@
 #include <err.h>
 #include <fcntl.h>
 #include <math.h>
+#include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -40,6 +41,14 @@ static uint32_t g_hit_over;
 static uint32_t g_hit_ch;
 static uint32_t g_hit_tdc;
 static uint64_t g_hit_ts;
+
+static int g_do_quit;
+
+void
+sighandler(int a_signum)
+{
+  g_do_quit = 1;
+}
 
 double
 time_get(void)
@@ -161,15 +170,18 @@ main(int argc, char **argv)
 
   char *opath;
   int fd;
-  uint32_t frame_prev = 0xffffffff;
+  std::vector<uint32_t> frame_prev;
+  frame_prev.resize(16);
 
   unsigned tot_byte = 0;
   unsigned tot_marker = 0;
   unsigned tot_hit = 0;
   unsigned tot = 0;
 
-  if (2 != argc) {
-    errx(EXIT_FAILURE, "Usage: %s in-file", argv[0]);
+  signal(SIGINT, sighandler);
+
+  if (2 != argc && 3 != argc) {
+    errx(EXIT_FAILURE, "Usage: %s in-file (out-file)", argv[0]);
   }
 
   fd = open(argv[1], O_RDONLY);
@@ -177,9 +189,13 @@ main(int argc, char **argv)
     err(EXIT_FAILURE, "open(%s)", argv[1]);
   }
 
-  opath = (char *)malloc(strlen(argv[1]) + 5 + 1);
-  strcpy(opath, argv[1]);
-  strcat(opath, ".root");
+  if (2 == argc) {
+    opath = (char *)malloc(strlen(argv[1]) + 5 + 1);
+    strcpy(opath, argv[1]);
+    strcat(opath, ".root");
+  } else {
+    opath = strdup(argv[2]);
+  }
 
   TFile ofile(opath, "RECREATE");
   auto tree = new TTree("tree", "SRS VMM3 data");
@@ -197,7 +213,7 @@ main(int argc, char **argv)
   tree->Branch("hit_tdc",    &g_hit_tdc,    "hit_tdc[hit]/i");
   tree->Branch("hit_ts",     &g_hit_ts,     "hit_ts[hit]/l");
 
-  for (;;) {
+  while (!g_do_quit) {
     ssize_t bytes, end, i;
 
     /* Read block. */
@@ -240,15 +256,15 @@ main(int argc, char **argv)
         uint32_t frame;
 
         /* Looks like a header. */
-        g_hit_fec = id & 0xff;
+        g_hit_fec = (id & 0xff) >> 4;
         frame = BUF_R32(has_size * sizeof(uint32_t));
-        if (0xffffffff != frame_prev &&
-            frame_prev + 1 != frame) {
+        if (0 != frame_prev[g_hit_fec] &&
+            frame_prev[g_hit_fec] + 1 != frame) {
           fprintf(stderr, "Frame counter "
               "mismatch (0x%08x -> 0x%08x)!\n",
-              frame_prev, frame);
+              frame_prev[g_hit_fec], frame);
         }
-        frame_prev = frame;
+        frame_prev[g_hit_fec] = frame;
 
         has_header = 1;
 
