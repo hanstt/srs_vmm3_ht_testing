@@ -116,18 +116,17 @@ read_event(uint64_t cycle, uint16_t trig)
 		if (g_buf_bytes >= 12) {
 			if (0x56 == g_buf[ 8] &&
 			    0x4d == g_buf[ 9] &&
-			    0x33 == g_buf[10] &&
-			    0x20 == g_buf[11]) {
+			    0x33 == g_buf[10]) {
 				chunk_bytes =
 				    g_buf[0] << 24 |
 				    g_buf[1] << 16 |
 				    g_buf[2] <<  8 |
 				    g_buf[3] <<  0;
+				chunk_bytes += 4;
 				if (g_buf_bytes < chunk_bytes) {
 					do_read = 1;
 				} else {
 					/* Enough data to cover a chunk. */
-					chunk_bytes += 4;
 					break;
 				}
 			} else {
