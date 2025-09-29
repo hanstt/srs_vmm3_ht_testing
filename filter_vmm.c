@@ -586,7 +586,7 @@ roi(lwroc_pipe_buffer_consumer *pipe_buf, lwroc_data_pipe_handle *data_handle)
 			HEAP_EXTRACT(g_ms_heap, ms, fail);
 
 			/* Write MS. */
-			*p32++ = ms.adc << 16 | ms.vmm_i;
+			*p32++ = ms.adc << 16 | ms.fec_i << 4 | ms.vmm_i;
 			*p32++ = (uint32_t)(ms.ht >> 32);
 			*p32++ = (uint32_t)ms.ht;
 			++vmm_n;
