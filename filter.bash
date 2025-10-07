@@ -4,6 +4,7 @@
 	--label=FILT \
 	--port=8000 \
 	--drasi=localhost \
+	--server=drasi,dest=localhost:9000 \
 	--merge-mode=event \
 	--merge-no-validate \
 	--buf=size=1Gi \
