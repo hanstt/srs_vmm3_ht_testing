@@ -13,15 +13,17 @@
 #include "heap.h"
 #include "ungray_table.h"
 
-#define WR_ID 0x100
+/* From 0x1 to 0x3f. */
+#define WR_ID 0x10
 
 #define ROI_LEFT_US -10.0
 #define ROI_RIGHT_US +10.0
 
 #define MS_WINDOW_NS 100.0
 
-/* Wait this long until we start building events. */
-#define HT_DT_SAFE_S 1.0
+/* If it takes 5 s to collect data from VMM, force-build events. */
+#define HT_DT_TOO_LITTLE_S 0.1
+#define HT_DT_TOO_MUCH_S 5.0
 
 /*
  * VMM stuff.
@@ -60,13 +62,17 @@ static void roi(lwroc_pipe_buffer_consumer *, lwroc_data_pipe_handle *);
 
 #define TS2NS 22.5 /* (5.24288 / 0.233045) */
 
-#define ROI_LEFT_TS (1e2 * ROI_LEFT_US)
-#define ROI_RIGHT_TS (1e2 * ROI_RIGHT_US)
+#define ROI_LEFT_HT (1e2 * ROI_LEFT_US)
+#define ROI_RIGHT_HT (1e2 * ROI_RIGHT_US)
 
-#define MS_WINDOW_TS (0.1 * MS_WINDOW_NS)
+#define MS_WINDOW_HT (0.1 * MS_WINDOW_NS)
+
+#define HT_DT_TOO_LITTLE_HT (1e8 * HT_DT_TOO_LITTLE_S)
+#define HT_DT_TOO_MUCH_HT (1e8 * HT_DT_TOO_MUCH_S)
 
 #define LENGTH(x) (sizeof x / sizeof *x)
 #define MAX(a, b) ((a) > (b) ? (a) : (b))
+#define MIN(a, b) ((a) < (b) ? (a) : (b))
 #define SUBMOD(l, r, range) \
     ((((int64_t)(l - r) + (range) + (range)/2) & ((range) - 1)) - (range)/2)
 
@@ -78,19 +84,19 @@ static void roi(lwroc_pipe_buffer_consumer *, lwroc_data_pipe_handle *);
 
 /* wr == rd -> empty, wr+1 == rd -> full. */
 #define CIRC_DECL(Type) struct { \
-	size_t	num; \
+	size_t	capacity; \
 	size_t	rd_i; \
 	size_t	wr_i; \
 	struct	Type *arr; \
 }
-#define CIRC_GETNUM(circ) ((circ.wr_i - circ.rd_i) % circ.num)
+#define CIRC_GETNUM(circ) ((circ.wr_i - circ.rd_i) % circ.capacity)
 #define CIRC_INIT(circ, N) do { \
-	circ.num = N; \
+	circ.capacity = N; \
 	circ.rd_i = 0; \
 	circ.wr_i = 0; \
 	circ.arr = calloc(N, sizeof *circ.arr); \
 } while (0)
-#define CIRC_STEP(circ, idx, ofs) ((circ.idx + ofs) & (circ.num - 1))
+#define CIRC_STEP(circ, idx, ofs) ((circ.idx + ofs) & (circ.capacity - 1))
 #define CIRC_PEEK(ptr, circ, ofs) do { \
 	size_t i_; \
 	assert(CIRC_GETNUM(circ) > 0); \
@@ -100,7 +106,7 @@ static void roi(lwroc_pipe_buffer_consumer *, lwroc_data_pipe_handle *);
 #define CIRC_PEEK_REV(ptr, circ, ofs) do { \
 	size_t i_; \
 	assert(CIRC_GETNUM(circ) > 0); \
-	i_ = CIRC_STEP(circ, wr_i, circ.num - ofs - 1); \
+	i_ = CIRC_STEP(circ, wr_i, circ.capacity - ofs - 1); \
 	ptr = &circ.arr[i_]; \
 } while (0)
 #define CIRC_DROP(circ) do { \
@@ -121,7 +127,7 @@ static void roi(lwroc_pipe_buffer_consumer *, lwroc_data_pipe_handle *);
 } while (0)
 #define CIRC_FOREACH(idx, circ) \
     for (idx = circ.rd_i; idx != circ.wr_i; \
-	idx = (idx + 1) & (circ.num - 1))
+	idx = (idx + 1) & (circ.capacity - 1))
 
 struct HtPair {
 	uint64_t	ht;
@@ -156,6 +162,7 @@ struct Vmm {
 			uint64_t	ht;
 		} ht;
 	} ht_build;
+	uint64_t ht_latest;
 	/* 256 * 5.24 ms ~= 1.3 s. */
 	CIRC_DECL(HtPair) ht_buf;
 	/* 1<<17 / 1.3 s ~= 100 kHz. */
@@ -175,7 +182,6 @@ struct Fec {
 	struct	Vmm *vmm_arr;
 };
 
-static uint64_t	g_ht_latest;
 static struct Fec *g_fec_arr;
 static size_t g_fec_num;
 static uint32_t g_fec_i;
@@ -208,16 +214,16 @@ int
 is_ht_ch(unsigned a_vmm_i, unsigned a_ch_i)
 {
 	return
-	    (0 == a_vmm_i &&  3 == a_ch_i) ||
-	    (1 == a_vmm_i && 37 == a_ch_i);
+	    (0 == a_vmm_i && 57 == a_ch_i) ||
+	    (1 == a_vmm_i &&  7 == a_ch_i);
 }
 
 int
 is_ms_ch(unsigned a_vmm_i, unsigned a_ch_i)
 {
 	return
-	    (0 == a_vmm_i &&  1 == a_ch_i) ||
-	    (1 == a_vmm_i && 53 == a_ch_i);
+	    (0 == a_vmm_i && 63 == a_ch_i) ||
+	    (1 == a_vmm_i &&  1 == a_ch_i);
 }
 
 int
@@ -506,13 +512,37 @@ process_marker(uint32_t a_u32, uint16_t a_u16)
 	vmm->ts_marker = ts;
 }
 
+uint64_t g_ht_prev = 0;
+
 void
 roi(lwroc_pipe_buffer_consumer *pipe_buf, lwroc_data_pipe_handle *data_handle)
 {
+	size_t fec_i, vmm_i;
+	uint64_t ht_last_max = 0;
+	uint64_t ht_last_min = UINT64_MAX;
+
+	/*
+	 * Find max/min latest hits in any VMM.
+	 *  - If (max - first_ms_ht) is large, build so buffers are emptied.
+	 *  - If (min - first_ms_ht) is small, events may fragment.
+	 */
+	for (fec_i = 0; fec_i < g_fec_num; ++fec_i) {
+		struct Fec *fec;
+
+		fec = &g_fec_arr[fec_i];
+		for (vmm_i = 0; vmm_i < fec->vmm_num; ++vmm_i) {
+			struct Vmm *vmm;
+
+			vmm = &fec->vmm_arr[vmm_i];
+			ht_last_max = MAX(ht_last_max, vmm->ht_latest);
+			ht_last_min = MIN(ht_last_min, vmm->ht_latest);
+		}
+	}
+
 	/* Find as many ROI's as possible in current data. */
 	while (g_ms_heap.num) {
 		struct HtMs const *msp;
-		uint64_t dht, ht0;
+		uint64_t ht0;
 
 		void *p0;
 		lmd_event_10_1_host *ev;
@@ -526,15 +556,15 @@ roi(lwroc_pipe_buffer_consumer *pipe_buf, lwroc_data_pipe_handle *data_handle)
 		uint32_t sync_check;
 		uint32_t vmm_n;
 
-		/*
-		 * Peek at 1st MS and see if we have enough data to try to
-		 * build events.
-		 */
+		/* Peek at 1st MS and see what to do. */
 		msp = &g_ms_heap.arr[0];
 		ht0 = msp->ht;
-		dht = g_ht_latest - ht0;
-		if (dht < HT_DT_SAFE_S) {
-			break;
+		if (ht_last_max - ht0 < HT_DT_TOO_MUCH_HT) {
+			/* We don't have a crapload of data. */
+			if (ht_last_min - ht0 < HT_DT_TOO_LITTLE_HT) {
+				/* We actually have too little, bail. */
+				break;
+			}
 		}
 
 		/* Build LMD event. */
@@ -575,15 +605,25 @@ roi(lwroc_pipe_buffer_consumer *pipe_buf, lwroc_data_pipe_handle *data_handle)
 			struct HtMs ms;
 			struct Fec *fec;
 			struct Vmm *vmm;
+			uint64_t dht;
 			uint32_t *p_hit_n;
 			uint32_t hit_n;
 
 			msp = &g_ms_heap.arr[0];
 			dht = msp->ht - ht0;
-			if (dht > MS_WINDOW_TS) {
+			if (dht > MS_WINDOW_HT) {
 				break;
 			}
 			HEAP_EXTRACT(g_ms_heap, ms, fail);
+
+			if (msp->ht < g_ht_prev) {
+				LWROC_ERROR_FMT("%2u:%2u: Master starts "
+				    "out of order! (%08x%08x -> %08x%08x).",
+				    msp->fec_i, msp->vmm_i,
+				    PF_TS(g_ht_prev),
+				    PF_TS(msp->ht));
+			}
+			g_ht_prev = msp->ht;
 
 			/* Write MS. */
 			*p32++ = ms.adc << 16 | ms.fec_i << 4 | ms.vmm_i;
@@ -601,12 +641,12 @@ roi(lwroc_pipe_buffer_consumer *pipe_buf, lwroc_data_pipe_handle *data_handle)
 				struct HtHit hit;
 
 				hp = &vmm->hit_heap.arr[0];
-				if (ms.ht + ROI_RIGHT_TS < hp->ht) {
+				if (ms.ht + ROI_RIGHT_HT < hp->ht) {
 					/* Next hit outside ROI. */
 					break;
 				}
 				HEAP_EXTRACT(vmm->hit_heap, hit, fail);
-				if (ms.ht + ROI_LEFT_TS < hit.ht) {
+				if (ms.ht + ROI_LEFT_HT < hit.ht) {
 					uint32_t dht;
 
 					/* Write hit. */
@@ -692,7 +732,7 @@ find_ht_span:
 				    * (ht1->ht - ht0->ht)
 				    / (ht1->ts - ht0->ts)
 				    + ht0->ht;
-				g_ht_latest = MAX(g_ht_latest, ht);
+				vmm->ht_latest = MAX(vmm->ht_latest, ht);
 				if (is_ms_ch(vmm_i, ch->ch)) {
 					struct HtMs ms;
 
@@ -746,7 +786,7 @@ mon(void)
 	printf("MS-heap = %u/%u/%u\n",
 	    (unsigned)g_ms_heap_maxl,
 	    (unsigned)g_ms_heap_maxg,
-	    (unsigned)g_ms_heap.num);
+	    (unsigned)g_ms_heap.capacity);
 	g_ms_heap_maxl = 0;
 	for (fec_i = 0; fec_i < g_fec_num; ++fec_i) {
 		struct Fec *fec = fec_get(fec_i);
@@ -762,10 +802,10 @@ mon(void)
 			    (unsigned)vmm_i,
 			    (unsigned)vmm->stats.ht_maxl,
 			    (unsigned)vmm->stats.ht_maxg,
-			    (unsigned)vmm->ht_buf.num,
+			    (unsigned)vmm->ht_buf.capacity,
 			    (unsigned)vmm->stats.ch_maxl,
 			    (unsigned)vmm->stats.ch_maxg,
-			    (unsigned)vmm->ch_buf.num,
+			    (unsigned)vmm->ch_buf.capacity,
 			    (unsigned)vmm->stats.heap_maxl,
 			    (unsigned)vmm->stats.heap_maxg,
 			    (unsigned)vmm->hit_heap.capacity
@@ -945,6 +985,7 @@ loop(lwroc_pipe_buffer_consumer *pipe_buf, const lwroc_thread_block
 		}
 
 		/* Transform ms/hits to HT and populate heaps. */
+		puts("?");
 		raw2heap();
 
 		/* Look for ROI's. */
