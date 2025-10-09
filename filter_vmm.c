@@ -21,6 +21,13 @@
 
 #define MS_WINDOW_NS 100.0
 
+/*
+ * Heimtime pulse time differences multiplied by this, i.e.:
+ * slew_counter_add ~= 0x1000000 -> set to 0x1.
+ *                  ~= 0xa000000 -> set to 0xa.
+ */
+#define HT_SCALE 0x1
+
 /* If it takes 5 s to collect data from VMM, force-build events. */
 #define HT_DT_TOO_LITTLE_S 0.1
 #define HT_DT_TOO_MUCH_S 5.0
@@ -62,19 +69,19 @@ static void roi(lwroc_pipe_buffer_consumer *, lwroc_data_pipe_handle *);
 
 #define TS2NS 22.5 /* (5.24288 / 0.233045) */
 
-#define ROI_LEFT_HT (1e2 * ROI_LEFT_US)
-#define ROI_RIGHT_HT (1e2 * ROI_RIGHT_US)
+#define HT2NS (HT_SCALE / 10)
 
-#define MS_WINDOW_HT (0.1 * MS_WINDOW_NS)
+#define ROI_LEFT_HT (HT2NS * 1e3 * ROI_LEFT_US)
+#define ROI_RIGHT_HT (HT2NS * 1e3 * ROI_RIGHT_US)
 
-#define HT_DT_TOO_LITTLE_HT (1e8 * HT_DT_TOO_LITTLE_S)
-#define HT_DT_TOO_MUCH_HT (1e8 * HT_DT_TOO_MUCH_S)
+#define MS_WINDOW_HT (HT2NS * 1e0 * MS_WINDOW_NS)
+
+#define HT_DT_TOO_LITTLE_HT (HT2NS * 1e9 * HT_DT_TOO_LITTLE_S)
+#define HT_DT_TOO_MUCH_HT (HT2NS * 1e9 * HT_DT_TOO_MUCH_S)
 
 #define LENGTH(x) (sizeof x / sizeof *x)
 #define MAX(a, b) ((a) > (b) ? (a) : (b))
 #define MIN(a, b) ((a) < (b) ? (a) : (b))
-#define SUBMOD(l, r, range) \
-    ((((int64_t)(l - r) + (range) + (range)/2) & ((range) - 1)) - (range)/2)
 
 #define PF_TS(ts) \
 	(uint32_t)((ts) >> 32), \
@@ -313,16 +320,19 @@ process_ht(unsigned a_vmm_i, unsigned a_ch_i, uint32_t a_ts_curr)
 		dt_arr[i] =
 		    vmm->ht_build.history[i + 1] - vmm->ht_build.history[i];
 	}
-if(0)LWROC_INFO_FMT("%2u %2u %2u  %6.3f,%6.3f,%6.3f.",
+if(0)if(0==a_vmm_i)printf("%2u %2u %2u  %08x,%08x,%08x  %10.3f,%10.3f,%10.3f.\n",
 	g_fec_i, a_vmm_i, a_ch_i,
-	1e-6 * TS2NS * dt_arr[0],
-	1e-6 * TS2NS * dt_arr[1],
-	1e-6 * TS2NS * dt_arr[2]);
+	dt_arr[0],
+	dt_arr[1],
+	dt_arr[2],
+	1e-6 * TS2NS * HT_SCALE * dt_arr[0],
+	1e-6 * TS2NS * HT_SCALE * dt_arr[1],
+	1e-6 * TS2NS * HT_SCALE * dt_arr[2]);
 
-#define HT_P (uint32_t)(5.24288 * 1e6 / TS2NS)
-#define HT_0 (uint32_t)(0.16384 * 1e6 / TS2NS)
-#define HT_1 (uint32_t)(0.65536 * 1e6 / TS2NS)
-#define HT_APPROX(l, r) (fabs((l) - (r)) < 2e3)
+#define HT_P (uint32_t)(5.24288 * 1e6 / (TS2NS * HT_SCALE))
+#define HT_0 (uint32_t)(0.16384 * 1e6 / (TS2NS * HT_SCALE))
+#define HT_1 (uint32_t)(0.65536 * 1e6 / (TS2NS * HT_SCALE))
+#define HT_APPROX(l, r) (fabs((l) - (r)) < 1e2)
 
 	if (!vmm->ht_build.has_carry) {
 		/* Find 1<<19 pulses, then we start decoding. */
@@ -367,7 +377,8 @@ if(0)LWROC_INFO_FMT("%2u %2u %2u  %6.3f,%6.3f,%6.3f.",
 	            HT_APPROX(dt_arr[1], 1*HT_##bit)) || \
 		   HT_APPROX(dt_arr[1], 2*HT_##bit)) { \
 		bit_ts = vmm->ht_build.history[2] + \
-		    (uint32_t)((1e6 * (HT_P - 2*HT_##bit)) / TS2NS); \
+		    (uint32_t)((1e6 * (HT_P - 2*HT_##bit)) / \
+		    (TS2NS * HT_SCALE)); \
 		do_bit = 1 + bit; \
 	} \
 	} while (0)
@@ -380,7 +391,7 @@ if(0)LWROC_INFO_FMT("%2u %2u %2u  %6.3f,%6.3f,%6.3f.",
 	}
 
 	/* Create a timestamp for every 1<<19 pulse. */
-	if (do_inc) {
+	if (vmm->ht_build.ht.has && do_inc) {
 		vmm->ht_build.ht.ht += do_inc << 19;
 		/*
 		 * Don't complain about lost HT's, will happen when no
@@ -716,19 +727,23 @@ find_ht_span:
 			while (CIRC_GETNUM(vmm->ch_buf)) {
 				struct VmmChannel *ch;
 				uint64_t ht;
+				uint32_t dt0, dt1, t;
 
 				CIRC_PEEK(ch, vmm->ch_buf, 0);
-				if (SUBMOD(ht0->ts, ch->ts, 1 << 30) > 0) {
+				t = ch->ts;
+				dt0 = t - ht0->ts;
+				dt1 = ht1->ts - t;
+				if (dt0 > 0x80000000) {
 					/* Hit before 1st HT, drop hit. */
 					CIRC_DROP(vmm->ch_buf);
 					continue;
 				}
-				if (SUBMOD(ch->ts, ht1->ts, 1 << 30) > 0) {
+				if (dt1 > 0x80000000) {
 					/* Hit after 2nd HT, drop HT. */
 					CIRC_DROP(vmm->ht_buf);
 					goto find_ht_span;
 				}
-				ht = (ch->ts - ht0->ts)
+				ht = (t - ht0->ts)
 				    * (ht1->ht - ht0->ht)
 				    / (ht1->ts - ht0->ts)
 				    + ht0->ht;
@@ -985,7 +1000,6 @@ loop(lwroc_pipe_buffer_consumer *pipe_buf, const lwroc_thread_block
 		}
 
 		/* Transform ms/hits to HT and populate heaps. */
-		puts("?");
 		raw2heap();
 
 		/* Look for ROI's. */
