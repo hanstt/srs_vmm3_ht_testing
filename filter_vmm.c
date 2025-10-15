@@ -558,12 +558,13 @@ roi(lwroc_pipe_buffer_consumer *pipe_buf, lwroc_data_pipe_handle *data_handle)
 	/* Find as many ROI's as possible in current data. */
 	while (g_ms_heap.num) {
 		struct HtMs const *msp;
+		uint32_t id0;
 		uint64_t ht0;
 
 		void *p0;
 		lmd_event_10_1_host *ev;
 		lmd_subevent_10_1_host *sev;
-		uint32_t *p32, *p_vmm_n;
+		uint32_t *p32, *p_sc, *p_vmm_n;
 		uint8_t *p8;
 		uint32_t header_size;
 		uint32_t wr_size;
@@ -574,6 +575,7 @@ roi(lwroc_pipe_buffer_consumer *pipe_buf, lwroc_data_pipe_handle *data_handle)
 
 		/* Peek at 1st MS and see what to do. */
 		msp = &g_ms_heap.arr[0];
+		id0 = msp->fec_i << 4 | msp->vmm_i;
 		ht0 = msp->ht;
 		if (ht_last_max - ht0 < HT_DT_TOO_MUCH_HT) {
 			/* We don't have a crapload of data. */
@@ -608,10 +610,7 @@ roi(lwroc_pipe_buffer_consumer *pipe_buf, lwroc_data_pipe_handle *data_handle)
 		*p32++ = WHITE_RABBIT_STAMP_HH16_ID |
 		    (uint32_t)((ht0 >> 48) & 0xffff);
 
-		sync_check = msp->adc;
-
-		*p32++ = SYNC_CHECK_MAGIC | SYNC_CHECK_RECV |
-		    (sync_check & 0xffff);
+		p_sc = p32++;
 
 		p_vmm_n = p32++;
 		vmm_n = 0;
@@ -624,6 +623,7 @@ roi(lwroc_pipe_buffer_consumer *pipe_buf, lwroc_data_pipe_handle *data_handle)
 			uint64_t dht;
 			uint32_t *p_hit_n;
 			uint32_t hit_n;
+			uint32_t id;
 
 			msp = &g_ms_heap.arr[0];
 			dht = msp->ht - ht0;
@@ -631,6 +631,11 @@ roi(lwroc_pipe_buffer_consumer *pipe_buf, lwroc_data_pipe_handle *data_handle)
 				break;
 			}
 			HEAP_EXTRACT(g_ms_heap, ms, fail);
+
+			id = ms.fec_i << 4 | ms.vmm_i;
+			if (id0 == id) {
+				sync_check = ms.ht - ht0;
+			}
 
 			if (msp->ht < g_ht_prev) {
 				LWROC_ERROR_FMT("%2u:%2u: Master starts "
@@ -675,6 +680,10 @@ roi(lwroc_pipe_buffer_consumer *pipe_buf, lwroc_data_pipe_handle *data_handle)
 			}
 			*p_hit_n = hit_n;
 		}
+
+		*p_sc = SYNC_CHECK_MAGIC | SYNC_CHECK_RECV |
+		    (sync_check & 0xffff);
+
 		*p_vmm_n = vmm_n;
 
 		ev->_header.l_dlen =
