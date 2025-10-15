@@ -26,7 +26,7 @@
  * slew_counter_add ~= 0x1000000 -> set to 0x1.
  *                  ~= 0xa000000 -> set to 0xa.
  */
-#define HT_SCALE 0x1
+#define HT_SCALE 0xa
 
 /* If it takes 5 s to collect data from VMM, force-build events. */
 #define HT_DT_TOO_LITTLE_S 0.1
@@ -69,7 +69,7 @@ static void roi(lwroc_pipe_buffer_consumer *, lwroc_data_pipe_handle *);
 
 #define TS2NS 22.5 /* (5.24288 / 0.233045) */
 
-#define HT2NS (HT_SCALE / 10)
+#define HT2NS (HT_SCALE / 10.)
 
 #define ROI_LEFT_HT (HT2NS * 1e3 * ROI_LEFT_US)
 #define ROI_RIGHT_HT (HT2NS * 1e3 * ROI_RIGHT_US)
@@ -391,7 +391,7 @@ if(0)if(0==a_vmm_i)printf("%2u %2u %2u  %08x,%08x,%08x  %10.3f,%10.3f,%10.3f.\n"
 	}
 
 	/* Create a timestamp for every 1<<19 pulse. */
-	if (vmm->ht_build.ht.has && do_inc) {
+	if (0) if (vmm->ht_build.ht.has && do_inc) {
 		vmm->ht_build.ht.ht += do_inc << 19;
 		/*
 		 * Don't complain about lost HT's, will happen when no
@@ -407,7 +407,7 @@ if(0)if(0==a_vmm_i)printf("%2u %2u %2u  %08x,%08x,%08x  %10.3f,%10.3f,%10.3f.\n"
 		uint64_t ht = (uint64_t)vmm->ht_build.mask << 24;
 
 		if (vmm->ht_build.ht.has) {
-			if (vmm->ht_build.ht.ht != ht) {
+			if (vmm->ht_build.ht.ht + (4 << 24) != ht) {
 				LWROC_ERROR_FMT(
 				    "vmm=%u: Heimtime expected=%08x "
 				    "but got=%08x!",
@@ -433,6 +433,11 @@ if(0)if(0==a_vmm_i)printf("%2u %2u %2u  %08x,%08x,%08x  %10.3f,%10.3f,%10.3f.\n"
 			LWROC_INFO_FMT("%2u:%2u: HT = %08x.",
 			    g_fec_i, a_vmm_i,
 			    (uint32_t)vmm->ht_build.mask);
+		if (1) {
+			CIRC_PUSH(pair, "Heimtime", vmm->ht_buf, 0);
+			pair->ht = vmm->ht_build.ht.ht;
+			pair->ts = a_ts_curr;
+		}
 	}
 	if (do_clear) {
 		vmm->ht_build.bit_i = 0;
@@ -727,12 +732,12 @@ find_ht_span:
 			while (CIRC_GETNUM(vmm->ch_buf)) {
 				struct VmmChannel *ch;
 				uint64_t ht;
-				uint32_t dt0, dt1, t;
+				uint32_t dt0, dt1, ts;
 
 				CIRC_PEEK(ch, vmm->ch_buf, 0);
-				t = ch->ts;
-				dt0 = t - ht0->ts;
-				dt1 = ht1->ts - t;
+				ts = ch->ts;
+				dt0 = ts - ht0->ts;
+				dt1 = ht1->ts - ts;
 				if (dt0 > 0x80000000) {
 					/* Hit before 1st HT, drop hit. */
 					CIRC_DROP(vmm->ch_buf);
@@ -743,7 +748,7 @@ find_ht_span:
 					CIRC_DROP(vmm->ht_buf);
 					goto find_ht_span;
 				}
-				ht = (t - ht0->ts)
+				ht = (ts - ht0->ts)
 				    * (ht1->ht - ht0->ht)
 				    / (ht1->ts - ht0->ts)
 				    + ht0->ht;
