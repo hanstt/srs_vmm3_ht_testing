@@ -19,7 +19,7 @@
 #define ROI_LEFT_US -10.0
 #define ROI_RIGHT_US +10.0
 
-#define MS_WINDOW_NS 100.0
+#define MS_WINDOW_NS 800.0
 
 /*
  * Heimtime pulse time differences multiplied by this, i.e.:
