@@ -14,7 +14,7 @@
 #include "ungray_table.h"
 
 /* From 0x1 to 0x3f. */
-#define WR_ID 0x10
+#define WR_ID 0x11
 
 #define ROI_LEFT_US -10.0
 #define ROI_RIGHT_US +10.0
