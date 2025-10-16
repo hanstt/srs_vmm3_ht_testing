@@ -307,7 +307,7 @@ process_ht(unsigned a_vmm_i, unsigned a_ch_i, uint32_t a_ts_curr)
 	struct Vmm *vmm = vmm_get(fec, a_vmm_i);
 	struct HtPair *pair;
 	size_t i;
-	unsigned bit_ts;
+	uint32_t edge_ts;
 	int do_bit = 0, do_clear = 0, do_inc = 0;
 
 	/* Keep a list of pulse distances. */
@@ -345,14 +345,16 @@ if(0)if(0==a_vmm_i)printf("%2u %2u %2u  %08x,%08x,%08x  %10.3f,%10.3f,%10.3f.\n"
 		do_clear = 1;
 	}
 
-	if (HT_APPROX(dt_arr[0], HT_P)) {
+	edge_ts = vmm->ht_build.history[3];
+
+	if (HT_APPROX(dt_arr[2], HT_P)) {
 		do_inc = 1;
 		do_clear = 1;
-	} else if (HT_APPROX(dt_arr[0], 2*HT_P)) {
+	} else if (HT_APPROX(dt_arr[2], 2*HT_P)) {
 		/* Lost periodic pulse, increment twice. */
 		do_inc = 2;
 		do_clear = 1;
-	} else if (dt_arr[0] > 2.5*HT_P) {
+	} else if (dt_arr[2] > 2.5*HT_P) {
 		LWROC_ERROR_FMT("%2u:%2u: Lost HT carry signal.",
 		    g_fec_i, a_vmm_i);
 		vmm->ht_build.has_carry = 0;
@@ -366,19 +368,16 @@ if(0)if(0==a_vmm_i)printf("%2u %2u %2u  %08x,%08x,%08x  %10.3f,%10.3f,%10.3f.\n"
 	 * | w | w |...|
 	 * |...|2*w|...|
 	 * The latter two miss a definite timestamp for the ending 1<<19
-	 * pulse, we guesstimate it.
+	 * pulse, extrapolate.
 	 */
 #define TEST_BIT(bit) do { \
 	if (HT_APPROX(dt_arr[2], HT_P - 2*HT_##bit) || \
 	    HT_APPROX(dt_arr[2], HT_P - 1*HT_##bit)) { \
-		bit_ts = vmm->ht_build.history[3]; \
 		do_bit = 1 + bit; \
 	} else if ((HT_APPROX(dt_arr[0], 1*HT_##bit) && \
 	            HT_APPROX(dt_arr[1], 1*HT_##bit)) || \
 		   HT_APPROX(dt_arr[1], 2*HT_##bit)) { \
-		bit_ts = vmm->ht_build.history[2] + \
-		    (uint32_t)((1e6 * (HT_P - 2*HT_##bit)) / \
-		    (TS2NS * HT_SCALE)); \
+		edge_ts = vmm->ht_build.history[2] + (HT_P - 2*HT_##bit); \
 		do_bit = 1 + bit; \
 	} \
 	} while (0)
@@ -391,7 +390,7 @@ if(0)if(0==a_vmm_i)printf("%2u %2u %2u  %08x,%08x,%08x  %10.3f,%10.3f,%10.3f.\n"
 	}
 
 	/* Create a timestamp for every 1<<19 pulse. */
-	if (0) if (vmm->ht_build.ht.has && do_inc) {
+	if (1) if (vmm->ht_build.ht.has && do_inc) {
 		vmm->ht_build.ht.ht += do_inc << 19;
 		/*
 		 * Don't complain about lost HT's, will happen when no
@@ -399,7 +398,7 @@ if(0)if(0==a_vmm_i)printf("%2u %2u %2u  %08x,%08x,%08x  %10.3f,%10.3f,%10.3f.\n"
 		 */
 		CIRC_PUSH(pair, "Heimtime", vmm->ht_buf, 0);
 		pair->ht = vmm->ht_build.ht.ht;
-		pair->ts = a_ts_curr;
+		pair->ts = edge_ts;
 	}
 
 	if (32 == vmm->ht_build.bit_i) {
@@ -407,7 +406,7 @@ if(0)if(0==a_vmm_i)printf("%2u %2u %2u  %08x,%08x,%08x  %10.3f,%10.3f,%10.3f.\n"
 		uint64_t ht = (uint64_t)vmm->ht_build.mask << 24;
 
 		if (vmm->ht_build.ht.has) {
-			if (vmm->ht_build.ht.ht + (4 << 24) != ht) {
+			if (vmm->ht_build.ht.ht != ht) {
 				LWROC_ERROR_FMT(
 				    "vmm=%u: Heimtime expected=%08x "
 				    "but got=%08x!",
@@ -433,7 +432,7 @@ if(0)if(0==a_vmm_i)printf("%2u %2u %2u  %08x,%08x,%08x  %10.3f,%10.3f,%10.3f.\n"
 			LWROC_INFO_FMT("%2u:%2u: HT = %08x.",
 			    g_fec_i, a_vmm_i,
 			    (uint32_t)vmm->ht_build.mask);
-		if (1) {
+		if (0) {
 			CIRC_PUSH(pair, "Heimtime", vmm->ht_buf, 0);
 			pair->ht = vmm->ht_build.ht.ht;
 			pair->ts = a_ts_curr;
@@ -550,8 +549,12 @@ roi(lwroc_pipe_buffer_consumer *pipe_buf, lwroc_data_pipe_handle *data_handle)
 			struct Vmm *vmm;
 
 			vmm = &fec->vmm_arr[vmm_i];
-			ht_last_max = MAX(ht_last_max, vmm->ht_latest);
-			ht_last_min = MIN(ht_last_min, vmm->ht_latest);
+			if (vmm->ht_latest) {
+				ht_last_max = MAX(ht_last_max,
+				    vmm->ht_latest);
+				ht_last_min = MIN(ht_last_min,
+				    vmm->ht_latest);
+			}
 		}
 	}
 
@@ -575,8 +578,6 @@ roi(lwroc_pipe_buffer_consumer *pipe_buf, lwroc_data_pipe_handle *data_handle)
 
 		/* Peek at 1st MS and see what to do. */
 		msp = &g_ms_heap.arr[0];
-		id0 = msp->fec_i << 4 | msp->vmm_i;
-		ht0 = msp->ht;
 		if (ht_last_max - ht0 < HT_DT_TOO_MUCH_HT) {
 			/* We don't have a crapload of data. */
 			if (ht_last_min - ht0 < HT_DT_TOO_LITTLE_HT) {
@@ -584,6 +585,8 @@ roi(lwroc_pipe_buffer_consumer *pipe_buf, lwroc_data_pipe_handle *data_handle)
 				break;
 			}
 		}
+		id0 = msp->fec_i << 4 | msp->vmm_i;
+		ht0 = msp->ht;
 
 		/* Build LMD event. */
 
@@ -598,6 +601,16 @@ roi(lwroc_pipe_buffer_consumer *pipe_buf, lwroc_data_pipe_handle *data_handle)
 		ev = p0;
 		sev = (void *)(ev + 1);
 		p32 = (void *)(sev + 1);
+
+if(0){
+static uint64_t ht0_prev;
+uint64_t dht = ht0 - ht0_prev;
+if (fabs((double)dht - 1000000) > 100)
+printf("ROI %2u %2u %08x%08x %d\n",
+    msp->fec_i, msp->vmm_i,
+    PF_TS(ht0), (int)(dht));
+ht0_prev = ht0;
+}
 
 		*p32++ = (WR_ID << WHITE_RABBIT_STAMP_EBID_BRANCH_ID_SHIFT) &
 		    WHITE_RABBIT_STAMP_EBID_BRANCH_ID_MASK;
@@ -637,14 +650,14 @@ roi(lwroc_pipe_buffer_consumer *pipe_buf, lwroc_data_pipe_handle *data_handle)
 				sync_check = ms.ht - ht0;
 			}
 
-			if (msp->ht < g_ht_prev) {
+			if (ms.ht < g_ht_prev) {
 				LWROC_ERROR_FMT("%2u:%2u: Master starts "
 				    "out of order! (%08x%08x -> %08x%08x).",
-				    msp->fec_i, msp->vmm_i,
+				    ms.fec_i, ms.vmm_i,
 				    PF_TS(g_ht_prev),
-				    PF_TS(msp->ht));
+				    PF_TS(ms.ht));
 			}
-			g_ht_prev = msp->ht;
+			g_ht_prev = ms.ht;
 
 			/* Write MS. */
 			*p32++ = ms.adc << 16 | ms.fec_i << 4 | ms.vmm_i;
