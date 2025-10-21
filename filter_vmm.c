@@ -19,7 +19,7 @@
 #define ROI_LEFT_US -10.0
 #define ROI_RIGHT_US +10.0
 
-#define MS_WINDOW_NS 800.0
+#define MS_WINDOW_NS 2700.0
 
 /*
  * Heimtime pulse time differences multiplied by this, i.e.:
@@ -44,6 +44,7 @@ static uint32_t g_evtcnt;
 struct HtMs {
 	uint16_t	fec_i;
 	uint16_t	vmm_i;
+	uint32_t	ts;
 	uint64_t	ht;
 	uint16_t	adc;
 };
@@ -153,8 +154,7 @@ struct VmmChannel {
 struct Vmm {
 	uint64_t	ts_marker;
 	struct {
-		/* Last three pulse diffs to survive lost pulses. */
-		uint32_t	history[4];
+		uint32_t	ts_prev;
 		/* Locked 1<<19 pulses. */
 		int	has_carry;
 		/* HT under construction. */
@@ -218,7 +218,7 @@ ungray(uint32_t a_u)
 }
 
 int
-is_ht_ch(unsigned a_vmm_i, unsigned a_ch_i)
+is_ht_ch1(unsigned a_vmm_i, unsigned a_ch_i)
 {
 	return
 	    (0 == a_vmm_i && 57 == a_ch_i) ||
@@ -226,11 +226,27 @@ is_ht_ch(unsigned a_vmm_i, unsigned a_ch_i)
 }
 
 int
-is_ms_ch(unsigned a_vmm_i, unsigned a_ch_i)
+is_ht_ch2(unsigned a_vmm_i, unsigned a_ch_i)
+{
+	return
+	    (0 == a_vmm_i && 55 == a_ch_i) ||
+	    (1 == a_vmm_i &&  9 == a_ch_i);
+}
+
+int
+is_ms_ch1(unsigned a_vmm_i, unsigned a_ch_i)
+{
+	return
+	    (0 == a_vmm_i && 61 == a_ch_i) ||
+	    (1 == a_vmm_i &&  1 == a_ch_i);
+}
+
+int
+is_ms_ch2(unsigned a_vmm_i, unsigned a_ch_i)
 {
 	return
 	    (0 == a_vmm_i && 63 == a_ch_i) ||
-	    (1 == a_vmm_i &&  1 == a_ch_i);
+	    (1 == a_vmm_i &&  3 == a_ch_i);
 }
 
 int
@@ -299,6 +315,10 @@ fail:
 	err(EXIT_FAILURE, "Hit heap init failed");
 }
 
+uint32_t g_ht_push[20];
+uint32_t g_ht_got[20];
+
+#if 0
 void
 process_ht(unsigned a_vmm_i, unsigned a_ch_i, uint32_t a_ts_curr)
 {
@@ -320,7 +340,7 @@ process_ht(unsigned a_vmm_i, unsigned a_ch_i, uint32_t a_ts_curr)
 		dt_arr[i] =
 		    vmm->ht_build.history[i + 1] - vmm->ht_build.history[i];
 	}
-if(0)if(0==a_vmm_i)printf("%2u %2u %2u  %08x,%08x,%08x  %10.3f,%10.3f,%10.3f.\n",
+if(0)if(1==a_vmm_i)printf("%2u %2u %2u  %08x,%08x,%08x  %10.3f,%10.3f,%10.3f.\n",
 	g_fec_i, a_vmm_i, a_ch_i,
 	dt_arr[0],
 	dt_arr[1],
@@ -329,10 +349,10 @@ if(0)if(0==a_vmm_i)printf("%2u %2u %2u  %08x,%08x,%08x  %10.3f,%10.3f,%10.3f.\n"
 	1e-6 * TS2NS * HT_SCALE * dt_arr[1],
 	1e-6 * TS2NS * HT_SCALE * dt_arr[2]);
 
-#define HT_P (uint32_t)(5.24288 * 1e6 / (TS2NS * HT_SCALE))
-#define HT_0 (uint32_t)(0.16384 * 1e6 / (TS2NS * HT_SCALE))
-#define HT_1 (uint32_t)(0.65536 * 1e6 / (TS2NS * HT_SCALE))
-#define HT_APPROX(l, r) (fabs((l) - (r)) < 1e2)
+#define HT_P (5.24288 * 1e6 / (TS2NS * HT_SCALE))
+#define HT_0 (0.16384 * 1e6 / (TS2NS * HT_SCALE))
+#define HT_1 (0.65536 * 1e6 / (TS2NS * HT_SCALE))
+#define HT_APPROX(l, r) (fabs((double)(l) - (double)(r)) < 10)
 
 	if (!vmm->ht_build.has_carry) {
 		/* Find 1<<19 pulses, then we start decoding. */
@@ -347,7 +367,8 @@ if(0)if(0==a_vmm_i)printf("%2u %2u %2u  %08x,%08x,%08x  %10.3f,%10.3f,%10.3f.\n"
 
 	edge_ts = vmm->ht_build.history[3];
 
-	if (HT_APPROX(dt_arr[2], HT_P)) {
+	if (HT_APPROX(dt_arr[2], HT_P) ||
+	    HT_APPROX(dt_arr[2] + dt_arr[1], HT_P)) {
 		do_inc = 1;
 		do_clear = 1;
 	} else if (HT_APPROX(dt_arr[2], 2*HT_P)) {
@@ -399,24 +420,39 @@ if(0)if(0==a_vmm_i)printf("%2u %2u %2u  %08x,%08x,%08x  %10.3f,%10.3f,%10.3f.\n"
 		CIRC_PUSH(pair, "Heimtime", vmm->ht_buf, 0);
 		pair->ht = vmm->ht_build.ht.ht;
 		pair->ts = edge_ts;
+if(0 && 1 == a_vmm_i){
+printf("Push %2u %20llu %d %d\n",
+    a_vmm_i,
+    pair->ht,
+    do_inc,
+    edge_ts - g_ht_push[a_vmm_i]);
+g_ht_push[a_vmm_i] = edge_ts;
+}
 	}
 
 	if (32 == vmm->ht_build.bit_i) {
 		/* Full Heimtime decoded! */
 		uint64_t ht = (uint64_t)vmm->ht_build.mask << 24;
+if(0 && 0 == a_vmm_i){
+printf("HT %2u %llu %d\n",
+    a_vmm_i,
+    ht,
+    edge_ts - g_ht_got[a_vmm_i]);
+g_ht_got[a_vmm_i] = edge_ts;
+}
 
 		if (vmm->ht_build.ht.has) {
-			if (vmm->ht_build.ht.ht != ht) {
+			if (vmm->ht_build.ht.ht + 0*(4 << 24) != ht) {
 				LWROC_ERROR_FMT(
-				    "vmm=%u: Heimtime expected=%08x "
-				    "but got=%08x!",
-				    a_vmm_i,
-				    (uint32_t)(vmm->ht_build.ht.ht >> 24),
-				    vmm->ht_build.mask);
+				    "%2u:%2u: Heimtime expected=%08x%08x "
+				    "but got=%08x%08x!",
+				    g_fec_i, a_vmm_i,
+				    PF_TS(vmm->ht_build.ht.ht),
+				    PF_TS(ht));
 			} else if (vmm->ht_build.ht.ht > ht) {
 				LWROC_ERROR_FMT(
-				    "vmm=%u: Heimtime reversed %08x -> %08x!",
-				    a_vmm_i,
+				    "%2u:%2u: Heimtime reversed %08x -> %08x!",
+				    g_fec_i, a_vmm_i,
 				    (uint32_t)(vmm->ht_build.ht.ht >> 24),
 				    vmm->ht_build.mask);
 			}
@@ -433,6 +469,136 @@ if(0)if(0==a_vmm_i)printf("%2u %2u %2u  %08x,%08x,%08x  %10.3f,%10.3f,%10.3f.\n"
 			    g_fec_i, a_vmm_i,
 			    (uint32_t)vmm->ht_build.mask);
 		if (0) {
+			CIRC_PUSH(pair, "Heimtime", vmm->ht_buf, 0);
+			pair->ht = vmm->ht_build.ht.ht;
+			pair->ts = a_ts_curr;
+		}
+	}
+	if (do_clear) {
+		vmm->ht_build.bit_i = 0;
+		vmm->ht_build.mask = 0;
+	}
+}
+#endif
+
+void
+process_ht(unsigned a_vmm_i, unsigned a_ch_i, uint32_t a_ts_curr)
+{
+	struct Fec *fec = fec_get(g_fec_i);
+	struct Vmm *vmm = vmm_get(fec, a_vmm_i);
+	struct HtPair *pair;
+	size_t i;
+	uint32_t dts;
+	int do_bit = 0, do_clear = 0, do_inc = 0;
+
+#define HT_P (5.24288 * 1e6 / (TS2NS * HT_SCALE))
+#define HT_0 (0.16384 * 1e6 / (TS2NS * HT_SCALE))
+#define HT_1 (0.65536 * 1e6 / (TS2NS * HT_SCALE))
+#define HT_APPROX(l, r) (fabs((double)(l) - (double)(r)) < 10)
+
+	dts = a_ts_curr - vmm->ht_build.ts_prev;
+	vmm->ht_build.ts_prev = a_ts_curr;
+
+if(0)if(1==a_vmm_i)printf("HTP %2u %2u %2u  %08x  %10.3f.\n",
+	g_fec_i, a_vmm_i, a_ch_i,
+	dts,
+	1e-6 * TS2NS * HT_SCALE * dts);
+
+	if (!vmm->ht_build.has_carry) {
+		/* Find 1<<19 pulses, then we start decoding. */
+		if (!HT_APPROX(dts, HT_P)) {
+			return;
+		}
+		LWROC_INFO_FMT("%2u:%2u: Found HT carry.", g_fec_i, a_vmm_i);
+		vmm->ht_build.has_carry = 1;
+		do_clear = 1;
+	}
+
+	if (HT_APPROX(dts, HT_P)) {
+		do_inc = 1;
+		do_clear = 1;
+	}
+#define TEST_BIT(bit) \
+	else if (HT_APPROX(dts, HT_P - 2*HT_##bit)) { \
+		do_bit = 1 + bit; \
+	}
+	TEST_BIT(0)
+	TEST_BIT(1)
+	else if (
+	    !HT_APPROX(dts, HT_0) &&
+	    !HT_APPROX(dts, 2*HT_0) &&
+	    !HT_APPROX(dts, HT_1) &&
+	    !HT_APPROX(dts, 2*HT_1)) {
+		LWROC_ERROR_FMT("%2u:%2u: Lost HT carry signal.",
+		    g_fec_i, a_vmm_i);
+		vmm->ht_build.has_carry = 0;
+		return;
+	}
+	if (do_bit) {
+		vmm->ht_build.mask |= (do_bit - 1) << vmm->ht_build.bit_i;
+		++vmm->ht_build.bit_i;
+		do_inc = 1;
+	}
+
+	/* Create a timestamp for every 1<<19 pulse. */
+	if (0) if (vmm->ht_build.ht.has && do_inc) {
+		vmm->ht_build.ht.ht += do_inc << 19;
+		/*
+		 * Don't complain about lost HT's, will happen when no
+		 * MS coming in.
+		 */
+		CIRC_PUSH(pair, "Heimtime", vmm->ht_buf, 0);
+		pair->ht = vmm->ht_build.ht.ht;
+		pair->ts = a_ts_curr;
+if(0 && 1 == a_vmm_i){
+printf("Push %2u %08x%08x %d %d\n",
+    a_vmm_i,
+    PF_TS(pair->ht),
+    do_inc,
+    a_ts_curr - g_ht_push[a_vmm_i]);
+g_ht_push[a_vmm_i] = a_ts_curr;
+}
+	}
+
+	if (32 == vmm->ht_build.bit_i) {
+		/* Full Heimtime decoded! */
+		uint64_t ht = (uint64_t)vmm->ht_build.mask << 24;
+if(0 && 0 == a_vmm_i){
+printf("HT %2u %llu %d\n",
+    a_vmm_i,
+    ht,
+    a_ts_curr - g_ht_got[a_vmm_i]);
+g_ht_got[a_vmm_i] = a_ts_curr;
+}
+
+		if (vmm->ht_build.ht.has) {
+			if (vmm->ht_build.ht.ht + 1*(4 << 24) != ht) {
+				LWROC_ERROR_FMT(
+				    "%2u:%2u: Heimtime expected=%08x%08x "
+				    "but got=%08x%08x!",
+				    g_fec_i, a_vmm_i,
+				    PF_TS(vmm->ht_build.ht.ht),
+				    PF_TS(ht));
+			} else if (vmm->ht_build.ht.ht > ht) {
+				LWROC_ERROR_FMT(
+				    "%2u:%2u: Heimtime reversed %08x -> %08x!",
+				    g_fec_i, a_vmm_i,
+				    (uint32_t)(vmm->ht_build.ht.ht >> 24),
+				    vmm->ht_build.mask);
+			}
+		} else {
+			LWROC_INFO_FMT("%2u:%2u: Found HT=0x%08x.",
+			    g_fec_i, a_vmm_i,
+			    vmm->ht_build.mask);
+		}
+		do_clear = 1;
+		vmm->ht_build.ht.has = 1;
+		vmm->ht_build.ht.ht = ht;
+		if (0)
+			LWROC_INFO_FMT("%2u:%2u: HT = %08x.",
+			    g_fec_i, a_vmm_i,
+			    (uint32_t)vmm->ht_build.mask);
+		if (1) {
 			CIRC_PUSH(pair, "Heimtime", vmm->ht_buf, 0);
 			pair->ht = vmm->ht_build.ht.ht;
 			pair->ts = a_ts_curr;
@@ -485,12 +651,15 @@ process_hit(uint32_t a_u32, uint16_t a_u16)
 	vmm = vmm_get(fec, vmm_i);
 	ts = vmm->ts_marker + (ofs * 4096) + bcid;
 	if (0)
-		LWROC_INFO_FMT("%08x%08x.", PF_TS(ts));
+		LWROC_INFO_FMT("%2u %2u %08x%08x.",
+		    g_fec_i, vmm_i, PF_TS(ts));
 
-	if (is_ht_ch(vmm_i, ch_i)) {
+	if (is_ht_ch1(vmm_i, ch_i)) {
 		/* Stop! Heimtime! */
 		process_ht(vmm_i, ch_i, ts);
-	} else {
+	} else if (
+	    !is_ht_ch2(vmm_i, ch_i) &&
+	    !is_ms_ch2(vmm_i, ch_i)) {
 		/* MS or hit. */
 		struct VmmChannel *ch;
 
@@ -528,6 +697,8 @@ process_marker(uint32_t a_u32, uint16_t a_u16)
 }
 
 uint64_t g_ht_prev = 0;
+
+uint32_t g_ts_prev[10];
 
 void
 roi(lwroc_pipe_buffer_consumer *pipe_buf, lwroc_data_pipe_handle *data_handle)
@@ -602,13 +773,15 @@ roi(lwroc_pipe_buffer_consumer *pipe_buf, lwroc_data_pipe_handle *data_handle)
 		sev = (void *)(ev + 1);
 		p32 = (void *)(sev + 1);
 
-if(0){
-static uint64_t ht0_prev;
+if(0 && 1 == msp->vmm_i){
+static uint64_t ht0_prev, ts0_prev;
 uint64_t dht = ht0 - ht0_prev;
-if (fabs((double)dht - 1000000) > 100)
-printf("ROI %2u %2u %08x%08x %d\n",
+uint64_t dts = msp->ts - ts0_prev;
+printf("ROI %2u %2u %u %d %20llu %d\n",
     msp->fec_i, msp->vmm_i,
-    PF_TS(ht0), (int)(dht));
+    msp->ts, (int)(dts),
+    ht0, (int)(dht));
+ts0_prev = msp->ts;
 ht0_prev = ht0;
 }
 
@@ -629,6 +802,7 @@ ht0_prev = ht0;
 		vmm_n = 0;
 
 		/* For each VMM with the MS, extract hits in ROI. */
+if(0)puts("!");
 		while (g_ms_heap.num) {
 			struct HtMs ms;
 			struct Fec *fec;
@@ -640,10 +814,17 @@ ht0_prev = ht0;
 
 			msp = &g_ms_heap.arr[0];
 			dht = msp->ht - ht0;
+if(0 && 0 == msp->vmm_i)printf("dht=%08x%08x\n", PF_TS(dht));
 			if (dht > MS_WINDOW_HT) {
 				break;
 			}
 			HEAP_EXTRACT(g_ms_heap, ms, fail);
+
+			g_ts_prev[ms.vmm_i] = ms.ts;
+if(0 && 0 == ms.vmm_i)printf("%2u %08x %08x %d\n",
+    ms.vmm_i,
+    g_ts_prev[1], g_ts_prev[0],
+    (int)(g_ts_prev[1] - g_ts_prev[0]));
 
 			id = ms.fec_i << 4 | ms.vmm_i;
 			if (id0 == id) {
@@ -770,18 +951,54 @@ find_ht_span:
 					CIRC_DROP(vmm->ht_buf);
 					goto find_ht_span;
 				}
-				ht = (ts - ht0->ts)
-				    * (ht1->ht - ht0->ht)
-				    / (ht1->ts - ht0->ts)
-				    + ht0->ht;
+				ht = (double)(ts - ht0->ts)
+				    * (double)(ht1->ht - ht0->ht)
+				    / (double)(ht1->ts - ht0->ts)
+				    + (double)ht0->ht;
+if(0 && 1 == vmm_i) {
+static uint64_t ts_p[20];
+static uint64_t ht_p[20];
+if(ts-ts_p[vmm_i]>100){
+printf("Int %2u %2u %10u %10u %10u %10u %20llu %20llu %7d %7d %7d %08x%08x %d\n",
+    fec_i,
+    vmm_i,
+    ts,
+    ts-ts_p[vmm_i],
+    ht0->ts,
+    ht1->ts,
+    ht0->ht,
+    ht1->ht,
+    (int)(ts - ht0->ts),
+    (int)(ht1->ht - ht0->ht),
+    (int)(ht1->ts - ht0->ts),
+    PF_TS(ht),
+    (int)(ht - ht_p[vmm_i]));
+ts_p[vmm_i] = ts;
+ht_p[vmm_i] = ht;
+}
+}
 				vmm->ht_latest = MAX(vmm->ht_latest, ht);
-				if (is_ms_ch(vmm_i, ch->ch)) {
+				if (is_ms_ch1(vmm_i, ch->ch)) {
 					struct HtMs ms;
 
 					ms.fec_i = fec_i;
 					ms.vmm_i = vmm_i;
+					ms.ts = ts;
 					ms.ht = ht;
 					ms.adc = ch->adc;
+if(0 && 1 == vmm_i){
+static uint32_t tsp[20];
+static uint64_t htp[20];
+printf("MS %2u %2u %10u %10d %20llu %10d\n",
+    fec_i,
+    vmm_i,
+    ts,
+    ts - tsp[vmm_i],
+    ht,
+    ht - htp[vmm_i]);
+tsp[vmm_i] = ts;
+htp[vmm_i] = ht;
+}
 					HEAP_INSERT(g_ms_heap, ms, fail);
 				} else {
 					struct HtHit hit;
