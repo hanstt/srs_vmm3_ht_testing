@@ -1,5 +1,5 @@
 CC:=gcc
-DRASI_CONFIG:=../drasi/bin/drasi-config.sh
+DRASI_CONFIG:=../../drasi/bin/drasi-config.sh
 
 FUSER:=f_user
 GEN:=gen

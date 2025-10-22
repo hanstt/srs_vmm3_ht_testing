@@ -1,12 +1,16 @@
 #!/bin/bash
 
+. common.bash
+
+#valgrind --leak-check=full --show-reachable=yes \
+#gdb --args \
 ./filter_vmm \
 	--label=FILT \
-	--port=8000 \
+	--port=$TPC_PORT \
 	--drasi=localhost \
-	--server=drasi,dest=localhost:9000 \
 	--merge-mode=event \
 	--merge-no-validate \
-	--buf=size=1Gi \
-	--max-ev-size=0x100000 \
-	--server=stream:8001
+	--buf=size=6Gi \
+	--max-ev-size=0x1000000 \
+	--server=stream:8001\
+        --server=drasi,dest=$TO_NODE:$TO_PORT
