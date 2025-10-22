@@ -19,7 +19,7 @@
 #define ROI_LEFT_US -10.0
 #define ROI_RIGHT_US +10.0
 
-#define MS_WINDOW_NS 2700.0
+#define MS_WINDOW_NS 3000.0
 
 /*
  * Heimtime pulse time differences multiplied by this, i.e.:
@@ -221,32 +221,32 @@ int
 is_ht_ch1(unsigned a_vmm_i, unsigned a_ch_i)
 {
 	return
-	    (0 == a_vmm_i && 57 == a_ch_i) ||
-	    (1 == a_vmm_i &&  7 == a_ch_i);
+	    (0 == (a_vmm_i & 1) && 57 == a_ch_i) ||
+	    (1 == (a_vmm_i & 1) &&  7 == a_ch_i);
 }
 
 int
 is_ht_ch2(unsigned a_vmm_i, unsigned a_ch_i)
 {
 	return
-	    (0 == a_vmm_i && 55 == a_ch_i) ||
-	    (1 == a_vmm_i &&  9 == a_ch_i);
+	    (0 == (a_vmm_i & 1) && 55 == a_ch_i) ||
+	    (1 == (a_vmm_i & 1) &&  9 == a_ch_i);
 }
 
 int
 is_ms_ch1(unsigned a_vmm_i, unsigned a_ch_i)
 {
 	return
-	    (0 == a_vmm_i && 61 == a_ch_i) ||
-	    (1 == a_vmm_i &&  1 == a_ch_i);
+	    (0 == (a_vmm_i & 1) && 63 == a_ch_i) ||
+	    (1 == (a_vmm_i & 1) &&  1 == a_ch_i);
 }
 
 int
 is_ms_ch2(unsigned a_vmm_i, unsigned a_ch_i)
 {
 	return
-	    (0 == a_vmm_i && 63 == a_ch_i) ||
-	    (1 == a_vmm_i &&  3 == a_ch_i);
+	    (0 == (a_vmm_i & 1) && 61 == a_ch_i) ||
+	    (1 == (a_vmm_i & 1) &&  3 == a_ch_i);
 }
 
 int
@@ -457,7 +457,7 @@ g_ht_got[a_vmm_i] = edge_ts;
 				    vmm->ht_build.mask);
 			}
 		} else {
-			LWROC_INFO_FMT("%2u:%2u: Found HT=0x%08x.",
+			if (0) LWROC_INFO_FMT("%2u:%2u: Found HT=0x%08x.",
 			    g_fec_i, a_vmm_i,
 			    vmm->ht_build.mask);
 		}
@@ -509,7 +509,7 @@ if(0)if(1==a_vmm_i)printf("HTP %2u %2u %2u  %08x  %10.3f.\n",
 		if (!HT_APPROX(dts, HT_P)) {
 			return;
 		}
-		LWROC_INFO_FMT("%2u:%2u: Found HT carry.", g_fec_i, a_vmm_i);
+		if (0) LWROC_INFO_FMT("%2u:%2u: Found HT carry.", g_fec_i, a_vmm_i);
 		vmm->ht_build.has_carry = 1;
 		do_clear = 1;
 	}
@@ -529,7 +529,7 @@ if(0)if(1==a_vmm_i)printf("HTP %2u %2u %2u  %08x  %10.3f.\n",
 	    !HT_APPROX(dts, 2*HT_0) &&
 	    !HT_APPROX(dts, HT_1) &&
 	    !HT_APPROX(dts, 2*HT_1)) {
-		LWROC_ERROR_FMT("%2u:%2u: Lost HT carry signal.",
+		if (0) LWROC_ERROR_FMT("%2u:%2u: Lost HT carry signal.",
 		    g_fec_i, a_vmm_i);
 		vmm->ht_build.has_carry = 0;
 		return;
@@ -573,7 +573,7 @@ g_ht_got[a_vmm_i] = a_ts_curr;
 
 		if (vmm->ht_build.ht.has) {
 			if (vmm->ht_build.ht.ht + 1*(4 << 24) != ht) {
-				LWROC_ERROR_FMT(
+				if (0) LWROC_ERROR_FMT(
 				    "%2u:%2u: Heimtime expected=%08x%08x "
 				    "but got=%08x%08x!",
 				    g_fec_i, a_vmm_i,
@@ -624,6 +624,8 @@ process_hit(uint32_t a_u32, uint16_t a_u16)
 	struct Fec *fec;
 	struct Vmm *vmm;
 	uint64_t ts;
+
+if (vmm_i > 9) return;
 
 	/* Wireshark hax! */
 	/*
@@ -682,6 +684,8 @@ process_marker(uint32_t a_u32, uint16_t a_u16)
 	struct Fec *fec;
 	struct Vmm *vmm;
 
+if (vmm_i > 9) return;
+
 	if (0)
 		LWROC_INFO_FMT("Marker fec=%2u vmm=%2u  "
 		    "%08x:%04x  "
@@ -734,6 +738,7 @@ roi(lwroc_pipe_buffer_consumer *pipe_buf, lwroc_data_pipe_handle *data_handle)
 		struct HtMs const *msp;
 		uint32_t id0;
 		uint64_t ht0;
+		uint32_t ts0;
 
 		void *p0;
 		lmd_event_10_1_host *ev;
@@ -744,7 +749,7 @@ roi(lwroc_pipe_buffer_consumer *pipe_buf, lwroc_data_pipe_handle *data_handle)
 		uint32_t wr_size;
 		uint32_t payload_size;
 		uint32_t write_size;
-		uint32_t sync_check;
+		uint32_t sync_check = 0;
 		uint32_t vmm_n;
 
 		/* Peek at 1st MS and see what to do. */
@@ -758,12 +763,13 @@ roi(lwroc_pipe_buffer_consumer *pipe_buf, lwroc_data_pipe_handle *data_handle)
 		}
 		id0 = msp->fec_i << 4 | msp->vmm_i;
 		ht0 = msp->ht;
+		ts0 = msp->ts;
 
 		/* Build LMD event. */
 
 		header_size = sizeof ev + sizeof sev;
 		wr_size = (1 + 4 + 1) * sizeof (uint32_t);
-		payload_size = 0x100000;
+		payload_size = 0x1000000;
 
 		write_size = header_size + wr_size + payload_size;
 
@@ -785,16 +791,18 @@ ts0_prev = msp->ts;
 ht0_prev = ht0;
 }
 
+uint64_t ht1 = ht0 + 18196e3 + 5530 - 530010;
+
 		*p32++ = (WR_ID << WHITE_RABBIT_STAMP_EBID_BRANCH_ID_SHIFT) &
 		    WHITE_RABBIT_STAMP_EBID_BRANCH_ID_MASK;
 		*p32++ = WHITE_RABBIT_STAMP_LL16_ID |
-		    (uint32_t)((ht0 >>  0) & 0xffff);
+		    (uint32_t)((ht1 >>  0) & 0xffff);
 		*p32++ = WHITE_RABBIT_STAMP_LH16_ID |
-		    (uint32_t)((ht0 >> 16) & 0xffff);
+		    (uint32_t)((ht1 >> 16) & 0xffff);
 		*p32++ = WHITE_RABBIT_STAMP_HL16_ID |
-		    (uint32_t)((ht0 >> 32) & 0xffff);
+		    (uint32_t)((ht1 >> 32) & 0xffff);
 		*p32++ = WHITE_RABBIT_STAMP_HH16_ID |
-		    (uint32_t)((ht0 >> 48) & 0xffff);
+		    (uint32_t)((ht1 >> 48) & 0xffff);
 
 		p_sc = p32++;
 
@@ -814,10 +822,11 @@ if(0)puts("!");
 
 			msp = &g_ms_heap.arr[0];
 			dht = msp->ht - ht0;
-if(0 && 0 == msp->vmm_i)printf("dht=%08x%08x\n", PF_TS(dht));
+if(0 && 0 == msp->vmm_i && dht)printf("dht=%08x%08x\n", PF_TS(dht));
 			if (dht > MS_WINDOW_HT) {
 				break;
 			}
+if(0)puts("Merge");
 			HEAP_EXTRACT(g_ms_heap, ms, fail);
 
 			g_ts_prev[ms.vmm_i] = ms.ts;
@@ -828,7 +837,7 @@ if(0 && 0 == ms.vmm_i)printf("%2u %08x %08x %d\n",
 
 			id = ms.fec_i << 4 | ms.vmm_i;
 			if (id0 == id) {
-				sync_check = ms.ht - ht0;
+				sync_check = ms.ts - ts0;
 			}
 
 			if (ms.ht < g_ht_prev) {
@@ -892,7 +901,7 @@ if(0 && 0 == ms.vmm_i)printf("%2u %08x %08x %d\n",
 		sev->_header.i_type = 10;
 		sev->_header.i_subtype = 1;
 		sev->i_procid = 0;
-		sev->h_subcrate = 0;
+		sev->h_subcrate =33;
 		sev->h_control = 0;
 
 		lwroc_used_event_space(data_handle,
@@ -1046,6 +1055,7 @@ mon(void)
 	    (unsigned)g_ms_heap_maxl,
 	    (unsigned)g_ms_heap_maxg,
 	    (unsigned)g_ms_heap.capacity);
+	printf("FC VM HT-buf        MS+hit-buf             Hit-heap\n");
 	g_ms_heap_maxl = 0;
 	for (fec_i = 0; fec_i < g_fec_num; ++fec_i) {
 		struct Fec *fec = fec_get(fec_i);
@@ -1053,10 +1063,10 @@ mon(void)
 		for (vmm_i = 0; vmm_i < fec->vmm_num; ++vmm_i) {
 			struct Vmm *vmm = vmm_get(fec, vmm_i);
 
-			printf("%2u:%2u: "
-			    "#HT=%3u/%3u/%3u "
-			    "#MS+hit=%6u/%6u/%6u "
-			    "#hit-heap=%6u/%6u/%6u\n",
+			printf("%2u %2u"
+			    " (%3u/%3u/%3u)"
+			    " (%6u/%6u/%6u)"
+			    " (%6u/%6u/%6u)\n",
 			    (unsigned)fec_i,
 			    (unsigned)vmm_i,
 			    (unsigned)vmm->stats.ht_maxl,
@@ -1088,7 +1098,7 @@ lwroc_user_filter_pre_setup_functions(void)
 	_lwroc_user_filter_functions->loop = loop;
 	_lwroc_user_filter_functions->max_ev_len = max_ev_len;
 	_lwroc_user_filter_functions->name = "filter_vmm";
-	HEAP_INIT(g_ms_heap, cmp_ms, 1 << 17, fail);
+	HEAP_INIT(g_ms_heap, cmp_ms, 1 << 24, fail);
 	return;
 fail:
 	err(EXIT_FAILURE, "MS heap init failed");
