@@ -177,15 +177,16 @@ struct Vmm {
 	CIRC_DECL(VmmChannel) ch_buf;
 	struct	HeapHit hit_heap;
 	struct {
+		unsigned	ht_num;
+		unsigned	ht_carry;
+		unsigned	ht_lost;
 		size_t	ht_maxg;
 		size_t	ht_maxl;
 		size_t	ch_maxg;
 		size_t	ch_maxl;
 		size_t	heap_maxg;
 		size_t	heap_maxl;
-		unsigned	ht_num;
-		unsigned	ht_carry;
-		unsigned	ht_lost;
+		unsigned	ms_num;
 	} stats;
 };
 struct Fec {
@@ -731,6 +732,7 @@ uint64_t ht1 = ht0 + 18196e3 + 5530 - 530010;
 				}
 			}
 			*p_hit_n = id << 20 | ms_n << 16 | hit_n;
+			++vmm->stats.ms_num;
 		}
 
 		*p_sc = SYNC_CHECK_MAGIC | SYNC_CHECK_RECV |
@@ -923,7 +925,7 @@ mon(void)
 	    (unsigned)g_ms_heap_maxl,
 	    (unsigned)g_ms_heap_maxg,
 	    (unsigned)g_ms_heap.capacity);
-	printf("FC VM HT                     HT-buf        MS+hit-buf             Hit-heap\n");
+	printf("FC VM HT                     HT-buf        MS+hit-buf             Hit-heap                  MS\n");
 	g_ms_heap_maxl = 0;
 	for (fec_i = 0; fec_i < g_fec_num; ++fec_i) {
 		struct Fec *fec = fec_get(fec_i);
@@ -935,7 +937,7 @@ mon(void)
 			    " (%6u/%6u/%6u)"
 			    " (%3u/%3u/%3u)"
 			    " (%6u/%6u/%6u)"
-			    " (%6u/%6u/%6u)\n",
+			    " (%6u/%6u/%6u) %10u\n",
 			    (unsigned)fec_i,
 			    (unsigned)vmm_i,
 			    vmm->stats.ht_num,
@@ -949,7 +951,8 @@ mon(void)
 			    (unsigned)vmm->ch_buf.capacity,
 			    (unsigned)vmm->stats.heap_maxl,
 			    (unsigned)vmm->stats.heap_maxg,
-			    (unsigned)vmm->hit_heap.capacity
+			    (unsigned)vmm->hit_heap.capacity,
+			    vmm->stats.ms_num
 			    );
 			vmm->stats.ht_maxl = 0;
 			vmm->stats.ch_maxl = 0;
