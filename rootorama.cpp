@@ -214,7 +214,8 @@ main(int argc, char **argv)
   tree->Branch("hit_ts",     &g_hit_ts,     "hit_ts[hit]/l");
 
   while (!g_do_quit) {
-    ssize_t bytes, end, i;
+    size_t end, i;
+    ssize_t bytes;
 
     /* Read block. */
     bytes = read(fd, buf + buf_ofs, BUF_SIZE);

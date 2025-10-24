@@ -236,8 +236,7 @@ if(0)printf("%2u: 1\n", vmm->ht_build.bit_i);
 		uint32_t ht = vmm->ht_build.mask;
 
 		/* Heimtimes should increase by 4. */
-if (0)
-		if (vmm->ht_build.ht > 0 && vmm->ht_build.ht + 4 != ht) {
+		if (0 && vmm->ht_build.ht > 0 && vmm->ht_build.ht + 4 != ht) {
 			printf("vmm=%u: Heimtime got=%08x but "
 			    "expected=%08x!\n",
 			    a_vmm_i,

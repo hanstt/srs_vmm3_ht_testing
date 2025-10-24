@@ -9,7 +9,7 @@ UNGRAY:=ungray
 UNGRAY_TABLE:=ungray_table.h
 FILTER_VMM:=filter_vmm
 
-CFLAGS:=-ggdb -Werror -O3
+CFLAGS:=-ggdb -Wall -Werror -O3
 ROOT_CFLAGS:=$(shell root-config --cflags)
 LDFLAGS:=
 ROOT_LIBS:=$(shell root-config --libs)
