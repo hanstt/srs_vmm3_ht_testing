@@ -40,10 +40,10 @@
  */
 
 static uint32_t g_evtcnt;
+static uint32_t g_evtcnt_rate;
 
 struct HtMs {
-	uint16_t	fec_i;
-	uint16_t	vmm_i;
+	uint32_t	id;
 	uint32_t	ts;
 	uint64_t	ht;
 };
@@ -57,8 +57,7 @@ static size_t	g_ms_heap_maxl;
 struct HtHit {
 	uint16_t	ch;
 	uint64_t	ht;
-	uint16_t	adc;
-	uint16_t	tdc;
+	uint32_t	adc_tdc;
 };
 HEAP_HEAD(HeapHit, HtHit);
 
@@ -149,8 +148,7 @@ struct HtPair {
 struct VmmChannel {
 	uint16_t	ch;
 	uint32_t	ts;
-	uint16_t	adc;
-	uint16_t	tdc;
+	uint32_t	adc_tdc;
 };
 struct Vmm {
 	uint64_t	ts_marker;
@@ -449,7 +447,7 @@ process_hit(uint32_t a_u32, uint16_t a_u16)
 	uint32_t vmm_i = 0x1f & (a_u32 >> 22);
 	uint32_t adc = 0x3ff & (a_u32 >> 12);
 	uint32_t bcid = ungray(0xfff & a_u32);
-	uint32_t over = 0x1 & (a_u16 >> 14);
+	/* uint32_t over = 0x1 & (a_u16 >> 14); */
 	uint32_t ch_i = 0x3f & (a_u16 >> 8);
 	uint32_t tdc = 0xff & a_u16;
 
@@ -458,11 +456,6 @@ process_hit(uint32_t a_u32, uint16_t a_u16)
 	uint64_t ts;
 
 	/* Wireshark hax! */
-	/*
-	if (16 == ofs) {
-		ofs = 5;
-	}
-	*/
 	if (31 == ofs) {
 		ofs = -1;
 	}
@@ -498,8 +491,7 @@ process_hit(uint32_t a_u32, uint16_t a_u16)
 		CIRC_PUSH(ch, "channel", vmm->ch_buf, 0);
 		ch->ch = ch_i;
 		ch->ts = ts;
-		ch->adc = over << 15 | adc;
-		ch->tdc = tdc;
+		ch->adc_tdc = adc << 16 | tdc;
 	}
 }
 
@@ -601,22 +593,21 @@ roi(lwroc_pipe_buffer_consumer *pipe_buf, lwroc_data_pipe_handle *data_handle)
 			if (ms.ht < g_ht_prev) {
 				LWROC_ERROR_FMT("%2u:%2u: Master starts "
 				    "out of order! (%08x%08x -> %08x%08x).",
-				    ms.fec_i, ms.vmm_i,
+				    ms.id >> 4, ms.id & 0xf,
 				    PF_TS(g_ht_prev),
 				    PF_TS(ms.ht));
 			}
 			g_ht_prev = ms.ht;
-			id = ms.fec_i << 4 | ms.vmm_i;
-			if (vmm_arr[id].num >= 2) {
+			if (vmm_arr[ms.id].num >= 2) {
 				if (0) LWROC_ERROR_FMT(
 				    "%2u:%2u: Too many MS (%u)!",
-				    ms.fec_i, ms.vmm_i,
-				    (unsigned)vmm_arr[id].num);
+				    ms.id >> 4, ms.id & 0xf,
+				    (unsigned)vmm_arr[ms.id].num);
 			} else {
-				msp = &vmm_arr[id].ms[vmm_arr[id].num];
+				msp = &vmm_arr[ms.id].ms[vmm_arr[ms.id].num];
 				memcpy(msp, &ms, sizeof ms);
 			}
-			++vmm_arr[id].num;
+			++vmm_arr[ms.id].num;
 
 			/* Check if next MS is within window. */
 			msp = &g_ms_heap.arr[0];
@@ -639,18 +630,6 @@ roi(lwroc_pipe_buffer_consumer *pipe_buf, lwroc_data_pipe_handle *data_handle)
 		ev = p0;
 		sev = (void *)(ev + 1);
 		p32 = (void *)(sev + 1);
-
-if(0 && 1 == msp->vmm_i){
-static uint64_t ht0_prev, ts0_prev;
-uint64_t dht = ht0 - ht0_prev;
-uint64_t dts = msp->ts - ts0_prev;
-printf("ROI %2u %2u %u %d %20llu %d\n",
-    msp->fec_i, msp->vmm_i,
-    msp->ts, (int)(dts),
-    (unsigned long long)ht0, (int)(dht));
-ts0_prev = msp->ts;
-ht0_prev = ht0;
-}
 
 uint64_t ht1 = ht0 + 18196e3 + 5530 - 530010;
 
@@ -723,7 +702,7 @@ uint64_t ht1 = ht0 + 18196e3 + 5530 - 530010;
 					dht = 0x00ffffff &
 					    (hit.ht - ht0 + (1 << 23));
 					*p32++ = hit.ch << 24 | dht;
-					*p32++ = hit.adc << 16 | hit.tdc;
+					*p32++ = hit.adc_tdc;
 					++hit_n;
 				}
 			}
@@ -751,6 +730,8 @@ uint64_t ht1 = ht0 + 18196e3 + 5530 - 530010;
 
 		lwroc_used_event_space(data_handle,
 		    (uintptr_t)p32 - (uintptr_t)p0, 0);
+
+		++g_evtcnt_rate;
 	}
 	return;
 fail:
@@ -853,8 +834,7 @@ ht_p[vmm_i] = ht;
 				if (is_ms_ch1(vmm_i, ch->ch)) {
 					struct HtMs ms;
 
-					ms.fec_i = fec_i;
-					ms.vmm_i = vmm_i;
+					ms.id = fec_i << 4 | vmm_i;
 					ms.ts = ts;
 					ms.ht = ht;
 if(0 && 1 == vmm_i){
@@ -876,8 +856,7 @@ htp[vmm_i] = ht;
 
 					hit.ch = ch->ch;
 					hit.ht = ht;
-					hit.adc = ch->adc;
-					hit.tdc = ch->tdc;
+					hit.adc_tdc = ch->adc_tdc;
 					HEAP_INSERT(vmm->hit_heap, hit, fail);
 				}
 				CIRC_DROP(vmm->ch_buf);
@@ -913,10 +892,10 @@ mon(void)
 	if (t_prev + 1 > t) {
 		return;
 	}
-	t_prev = t;
 
 	range(&mem_f, mem_pre, g_mem);
-	printf("Mem=%5.1f%sB MS-heap=%u/%u/%u\n",
+	printf("MS/s=%8.2f/s  Mem=%5.1f%sB  MS-heap=%u/%u/%u\n",
+	    g_evtcnt_rate / (t - t_prev),
 	    mem_f, mem_pre,
 	    (unsigned)g_ms_heap_maxl,
 	    (unsigned)g_ms_heap_maxg,
@@ -955,6 +934,9 @@ mon(void)
 			vmm->stats.heap_maxl = 0;
 		}
 	}
+
+	g_evtcnt_rate = 0;
+	t_prev = t;
 }
 
 /* Drasi stuff. */

@@ -12,5 +12,4 @@
 	--merge-no-validate \
 	--buf=size=6Gi \
 	--max-ev-size=0x1000000 \
-	--server=stream:8001\
-        --server=drasi,dest=$TO_NODE:$TO_PORT
+	--server=stream:8001
