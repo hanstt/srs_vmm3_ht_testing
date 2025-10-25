@@ -457,8 +457,6 @@ process_hit(uint32_t a_u32, uint16_t a_u16)
 	struct Vmm *vmm;
 	uint64_t ts;
 
-if (vmm_i > 9) return;
-
 	/* Wireshark hax! */
 	/*
 	if (16 == ofs) {
@@ -515,8 +513,6 @@ process_marker(uint32_t a_u32, uint16_t a_u16)
 
 	struct Fec *fec;
 	struct Vmm *vmm;
-
-if (vmm_i > 9) return;
 
 	if (0)
 		LWROC_INFO_FMT("Marker fec=%2u vmm=%2u  "
