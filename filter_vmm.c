@@ -10,8 +10,11 @@
 #include <lmd/lwroc_lmd_util.h>
 #include <lmd/lwroc_lmd_white_rabbit_stamp.h>
 
-#include "heap.h"
 #include "ungray_table.h"
+
+/*
+ * "User" settings.
+ */
 
 /* From 0x1 to 0x3f. */
 #define WR_ID 0x11
@@ -33,50 +36,8 @@
 #define HT_DT_TOO_MUCH_S 5.0
 
 /*
- * VMM stuff.
- * There are two kinds of timestamps:
- *  ht = Heimtime
- *  ts = VMM
+ * Not-so-user settings.
  */
-
-static uint32_t g_evtcnt;
-static uint32_t g_evtcnt_rate;
-
-struct HtMs {
-	uint32_t	id;
-	uint32_t	ts;
-	uint64_t	ht;
-};
-static struct {
-	size_t	capacity;
-	size_t	head;
-	size_t	tail;
-	struct	HtMs *arr;
-} g_ms;
-/* "Global", total. */
-static size_t	g_ms_maxg;
-/* "Local", since last time. */
-static size_t	g_ms_maxl;
-static struct {
-	size_t	capacity;
-	size_t	num;
-	struct	HtMs *arr;
-} g_ms_new;
-
-struct HtHit {
-	uint16_t	ch;
-	uint64_t	ht;
-	uint32_t	adc_tdc;
-};
-HEAP_HEAD(HeapHit, HtHit);
-
-static void compact(void);
-static void process_hit(uint32_t, uint16_t);
-static void process_marker(uint32_t, uint16_t);
-static void range(float *, char *, uint64_t);
-static void raw2heap(void);
-static void roi(lwroc_pipe_buffer_consumer *, lwroc_data_pipe_handle *);
-static void sort(void);
 
 #define TS2NS 22.5 /* (5.24288 / 0.233045) */
 
@@ -98,7 +59,9 @@ static void sort(void);
 	(uint32_t)((ts) >> 32), \
 	(uint32_t)((ts) & 0xffffffff)
 
-/* Circular buffer code. */
+/*
+ * Circular buffer.
+ */
 
 /* wr == rd -> empty, wr+1 == rd -> full. */
 #define CIRC_DECL(Type) struct { \
@@ -116,11 +79,11 @@ static void sort(void);
 	g_mem += (N) * sizeof *circ.arr; \
 } while (0)
 #define CIRC_STEP(circ, idx, ofs) ((circ.idx + ofs) & (circ.capacity - 1))
-#define CIRC_PEEK(ptr, circ, ofs) do { \
+#define CIRC_PEEK(e, circ, ofs) do { \
 	size_t i_; \
 	assert(CIRC_GETNUM(circ) > 0); \
 	i_ = CIRC_STEP(circ, rd_i, ofs); \
-	ptr = &circ.arr[i_]; \
+	e = circ.arr[i_]; \
 } while (0)
 #define CIRC_PEEK_REV(ptr, circ, ofs) do { \
 	size_t i_; \
@@ -147,6 +110,110 @@ static void sort(void);
 #define CIRC_FOREACH(idx, circ) \
     for (idx = circ.rd_i; idx != circ.wr_i; \
 	idx = (idx + 1) & (circ.capacity - 1))
+
+/*
+ * Partially sorted array.
+ */
+
+#define SORT_DECL(Type) struct { \
+	struct { \
+		size_t	capacity; \
+		size_t	head; \
+		size_t	tail; \
+		struct	Type *arr; \
+	} sorted; \
+	struct { \
+		size_t	capacity; \
+		size_t	num; \
+		struct	Type *arr; \
+	} new; \
+}
+#define SORT_COMPACT(s) do { \
+	size_t num_; \
+	num_ = (s).sorted.tail - (s).sorted.head; \
+	memmove(&(s).sorted.arr[0], &(s).sorted.arr[(s).sorted.head], \
+	    num_ * sizeof *(s).sorted.arr); \
+	(s).sorted.head = 0; \
+	(s).sorted.tail = num_; \
+} while (0)
+#define SORT_FIRST(s) (s).sorted.arr[(s).sorted.head]
+#define SORT_INIT(s, sorted_n, new_n, fail) do { \
+	(s).sorted.capacity = sorted_n; \
+	(s).sorted.head = 0; \
+	(s).sorted.tail = 0; \
+	(s).sorted.arr = calloc(sorted_n, sizeof *(s).sorted.arr); \
+	if (!(s).sorted.arr) { \
+		goto fail; \
+	} \
+	(s).new.capacity = new_n; \
+	(s).new.num = 0; \
+	(s).new.arr = calloc(new_n, sizeof *(s).new.arr); \
+	if (!(s).new.arr) { \
+		goto fail; \
+	} \
+	g_mem += ((sorted_n) + (new_n)) * sizeof *(s).sorted.arr; \
+} while (0)
+#define SORT_MERGE(s, cmp) do { \
+	size_t old_i_, new_i_, dst_i_; \
+	/* Sort new data. */ \
+	qsort(&(s).new.arr[0], (s).new.num, sizeof *(s).new.arr, cmp); \
+	/* Merge new into old. */ \
+	old_i_ = (s).sorted.tail; \
+	new_i_ = (s).new.num; \
+	dst_i_ = old_i_ + new_i_; \
+	while (new_i_) { \
+		--dst_i_; \
+		(s).sorted.arr[dst_i_] = (!old_i_ || \
+		    cmp(&(s).new.arr[new_i_ - 1], \
+		           &(s).sorted.arr[old_i_ - 1]) > 0) \
+		    ? (s).new.arr[--new_i_] \
+		    : (s).sorted.arr[--old_i_]; \
+	} \
+	(s).sorted.tail += (s).new.num; \
+	(s).new.num = 0; \
+} while (0)
+#define SORT_NEXT(s) ++(s).sorted.head
+#define SORT_PUSH(s, e, fail) do { \
+	if ((s).new.num < (s).new.capacity) { \
+		(s).new.arr[(s).new.num++] = e; \
+	} else { \
+		goto fail; \
+	} \
+} while (0)
+#define SORT_SORTED_EMPTY(s) ((s).sorted.head == (s).sorted.tail)
+
+/*
+ * VMM stuff.
+ * There are two kinds of timestamps:
+ *  ht = Heimtime
+ *  ts = VMM
+ */
+
+static uint32_t g_evtcnt;
+static uint32_t g_evtcnt_rate;
+
+struct HtMs {
+	uint32_t	id;
+	uint32_t	ts;
+	uint64_t	ht;
+};
+SORT_DECL(HtMs) g_ms;
+/* "Global", total. */
+static size_t	g_ms_maxg;
+/* "Local", since last time. */
+static size_t	g_ms_maxl;
+
+struct HtHit {
+	uint16_t	ch;
+	uint64_t	ht;
+	uint32_t	adc_tdc;
+};
+
+static void process_hit(uint32_t, uint16_t);
+static void process_marker(uint32_t, uint16_t);
+static void range(float *, char *, uint64_t);
+static void raw2ht(void);
+static void roi(lwroc_pipe_buffer_consumer *, lwroc_data_pipe_handle *);
 
 struct HtPair {
 	uint64_t	ht;
@@ -184,7 +251,7 @@ struct Vmm {
 	CIRC_DECL(HtPair) ht_buf;
 	/* 1<<17 / 1.3 s ~= 100 kHz. */
 	CIRC_DECL(VmmChannel) ch_buf;
-	struct	HeapHit hit_heap;
+	SORT_DECL(HtHit) hit_sort;
 	struct {
 		unsigned	ht_num;
 		unsigned	ht_carry;
@@ -193,8 +260,8 @@ struct Vmm {
 		size_t	ht_maxl;
 		size_t	ch_maxg;
 		size_t	ch_maxl;
-		size_t	heap_maxg;
-		size_t	heap_maxl;
+		size_t	sort_maxg;
+		size_t	sort_maxl;
 		unsigned	ms_num;
 	} stats;
 };
@@ -275,20 +342,12 @@ cmp_ms(void const *a_l, void const *a_r)
 }
 
 int
-cmp_hit(struct HtHit const *a_l, struct HtHit const *a_r)
+cmp_hit(void const *a_l, void const *a_r)
 {
-	return a_l->ht < a_r->ht;
-}
+	struct HtHit const *l = a_l;
+	struct HtHit const *r = a_r;
 
-void
-compact(void)
-{
-	size_t num;
-
-	num = g_ms.tail - g_ms.head;
-	memmove(&g_ms.arr[0], &g_ms.arr[g_ms.head], num * sizeof *g_ms.arr);
-	g_ms.head = 0;
-	g_ms.tail = num;
+	return 1 - 2 * (l->ht < r->ht);
 }
 
 struct Fec *
@@ -332,8 +391,7 @@ vmm_get(struct Fec *a_fec, unsigned a_i)
 		free(a_fec->vmm_arr);
 		g_mem -= a_fec->vmm_num * sizeof *arr;
 		for (i = a_fec->vmm_num; i < num; ++i) {
-			HEAP_INIT(arr[i].hit_heap, cmp_hit, 1 << 18, fail);
-			g_mem += (1 << 18) * sizeof *arr[i].hit_heap.arr;
+			SORT_INIT(arr[i].hit_sort, 1 << 18, 1 << 12, fail);
 		}
 		a_fec->vmm_arr = arr;
 		a_fec->vmm_num = num;
@@ -345,7 +403,7 @@ vmm_get(struct Fec *a_fec, unsigned a_i)
 	}
 	return vmm;
 fail:
-	err(EXIT_FAILURE, "Hit heap init failed");
+	LWROC_FATAL("Hit array init failed!");
 }
 
 void
@@ -551,7 +609,7 @@ roi(lwroc_pipe_buffer_consumer *pipe_buf, lwroc_data_pipe_handle *data_handle)
 	}
 
 	/* Find as many ROI's as possible in current data. */
-	while (g_ms.head < g_ms.tail) {
+	while (!SORT_SORTED_EMPTY(g_ms)) {
 		struct HtMs ms;
 		uint64_t ht0;
 
@@ -567,7 +625,7 @@ roi(lwroc_pipe_buffer_consumer *pipe_buf, lwroc_data_pipe_handle *data_handle)
 		uint32_t id;
 
 		/* Peek at 1st MS and see what to do. */
-		ms = g_ms.arr[g_ms.head];
+		ms = SORT_FIRST(g_ms);
 		ht0 = ms.ht;
 		if (ht_last_max - ht0 < HT_DT_TOO_MUCH_HT) {
 			/* We don't have a crapload of data. */
@@ -579,7 +637,7 @@ roi(lwroc_pipe_buffer_consumer *pipe_buf, lwroc_data_pipe_handle *data_handle)
 
 		memset(vmm_arr, 0, sizeof vmm_arr);
 
-		while (g_ms.head < g_ms.tail) {
+		while (!SORT_SORTED_EMPTY(g_ms)) {
 			uint64_t dht;
 
 			/* Put MS in table. */
@@ -602,11 +660,11 @@ roi(lwroc_pipe_buffer_consumer *pipe_buf, lwroc_data_pipe_handle *data_handle)
 				msp = &vmm_arr[ms.id].ms[vmm_arr[ms.id].num];
 				memcpy(msp, &ms, sizeof ms);
 			}
-			++g_ms.head;
+			SORT_NEXT(g_ms);
 			++vmm_arr[ms.id].num;
 
 			/* Check if next MS is within window. */
-			ms = g_ms.arr[g_ms.head];
+			ms = SORT_FIRST(g_ms);
 			dht = ms.ht - ht0;
 			if (dht > MS_WINDOW_HT) {
 				break;
@@ -681,16 +739,14 @@ uint64_t ht1 = ht0 + 18196e3 + 5530 - 530010;
 
 			hit_n = 0;
 			ht0 = vmm_arr[id].ms[0].ht;
-			while (vmm->hit_heap.num) {
-				struct HtHit const *hp;
+			while (!SORT_SORTED_EMPTY(vmm->hit_sort)) {
 				struct HtHit hit;
 
-				hp = &vmm->hit_heap.arr[0];
-				if (ht0 + ROI_RIGHT_HT < hp->ht) {
+				hit = SORT_FIRST(vmm->hit_sort);
+				if (ht0 + ROI_RIGHT_HT < hit.ht) {
 					/* Next hit outside ROI. */
 					break;
 				}
-				HEAP_EXTRACT(vmm->hit_heap, hit, fail);
 				if (ht0 + ROI_LEFT_HT < hit.ht) {
 					uint32_t dht;
 
@@ -701,6 +757,7 @@ uint64_t ht1 = ht0 + 18196e3 + 5530 - 530010;
 					*p32++ = hit.adc_tdc;
 					++hit_n;
 				}
+				SORT_NEXT(vmm->hit_sort);
 			}
 			*p_hit_n = id << 20 | ms_n << 16 | hit_n;
 			++vmm->stats.ms_num;
@@ -729,9 +786,18 @@ uint64_t ht1 = ht0 + 18196e3 + 5530 - 530010;
 
 		++g_evtcnt_rate;
 	}
-	return;
-fail:
-	errx(EXIT_FAILURE, "Shouldn't happen");
+
+	for (fec_i = 0; fec_i < g_fec_num; ++fec_i) {
+		struct Fec *fec;
+
+		fec = &g_fec_arr[fec_i];
+		for (vmm_i = 0; vmm_i < fec->vmm_num; ++vmm_i) {
+			struct Vmm *vmm;
+
+			vmm = &fec->vmm_arr[vmm_i];
+			SORT_COMPACT(vmm->hit_sort);
+		}
+	}
 }
 
 void
@@ -753,7 +819,7 @@ range(float *a_f, char *a_pre, uint64_t a_val)
 }
 
 void
-raw2heap(void)
+raw2ht(void)
 {
 	unsigned fec_i, vmm_i;
 
@@ -762,9 +828,10 @@ raw2heap(void)
 
 		for (vmm_i = 0; vmm_i < fec->vmm_num; ++vmm_i) {
 			struct Vmm *vmm = vmm_get(fec, vmm_i);
-			struct HtPair const *ht0;
-			struct HtPair const *ht1;
+			struct HtPair ht0;
+			struct HtPair ht1;
 			size_t n;
+			double ht_f;
 
 			n = CIRC_GETNUM(vmm->ht_buf);
 			vmm->stats.ht_maxg = MAX(vmm->stats.ht_maxg, n);
@@ -776,20 +843,21 @@ raw2heap(void)
 find_ht_span:
 			if (CIRC_GETNUM(vmm->ht_buf) < 2) {
 				/* We need at least 2 HT's to interpolate. */
-				continue;
+				goto vmm_done;
 			}
 			CIRC_PEEK(ht0, vmm->ht_buf, 0);
 			CIRC_PEEK(ht1, vmm->ht_buf, 1);
+			ht_f = (double)(ht1.ht - ht0.ht) / (ht1.ts - ht0.ts);
 
 			while (CIRC_GETNUM(vmm->ch_buf)) {
-				struct VmmChannel *ch;
+				struct VmmChannel ch;
 				uint64_t ht;
 				uint32_t dt0, dt1, ts;
 
 				CIRC_PEEK(ch, vmm->ch_buf, 0);
-				ts = ch->ts;
-				dt0 = ts - ht0->ts;
-				dt1 = ht1->ts - ts;
+				ts = ch.ts;
+				dt0 = ts - ht0.ts;
+				dt1 = ht1.ts - ts;
 				if (dt0 > 0x80000000) {
 					/* Hit before 1st HT, drop hit. */
 					CIRC_DROP(vmm->ch_buf);
@@ -800,46 +868,40 @@ find_ht_span:
 					CIRC_DROP(vmm->ht_buf);
 					goto find_ht_span;
 				}
-				ht = (ts - ht0->ts)
-				    * (ht1->ht - ht0->ht)
-				    / (ht1->ts - ht0->ts)
-				    + ht0->ht;
+				CIRC_DROP(vmm->ch_buf);
+				ht = (ts - ht0.ts) * ht_f + ht0.ht;
 				vmm->ht_latest = MAX(vmm->ht_latest, ht);
-				if (is_ms_ch1(vmm_i, ch->ch)) {
-					if (g_ms_new.num < g_ms_new.capacity)
-					{
-						struct HtMs ms;
+				if (is_ms_ch1(vmm_i, ch.ch)) {
+					struct HtMs ms;
 
-						ms.id = fec_i << 4 | vmm_i;
-						ms.ts = ts;
-						ms.ht = ht;
-						g_ms_new.arr[g_ms_new.num++] =
-						    ms;
-					} else {
-						LWROC_ERROR_FMT(
-						    "%2u:%2u: MS overflow!",
-						    fec_i, vmm_i);
-					}
+					ms.id = fec_i << 4 | vmm_i;
+					ms.ts = ts;
+					ms.ht = ht;
+					SORT_PUSH(g_ms, ms, ms_fail);
 				} else {
 					struct HtHit hit;
 
-					hit.ch = ch->ch;
+					hit.ch = ch.ch;
 					hit.ht = ht;
-					hit.adc_tdc = ch->adc_tdc;
-					if(0)HEAP_INSERT(vmm->hit_heap, hit, fail);
+					hit.adc_tdc = ch.adc_tdc;
+					SORT_PUSH(vmm->hit_sort, hit,
+					    hit_fail);
 				}
-				CIRC_DROP(vmm->ch_buf);
 				continue;
-fail:
-				LWROC_ERROR_FMT(
-				    "%2u:%2u: Hit heap overflow!",
+ms_fail:
+				LWROC_ERROR_FMT("%2u:%2u: MS overflow!",
 				    fec_i, vmm_i);
-				CIRC_DROP(vmm->ch_buf);
+				continue;
+hit_fail:
+				LWROC_ERROR_FMT("%2u:%2u: Hit overflow!",
+				    fec_i, vmm_i);
 			}
-			vmm->stats.heap_maxg = MAX(vmm->stats.heap_maxg,
-			    vmm->hit_heap.num);
-			vmm->stats.heap_maxl = MAX(vmm->stats.heap_maxl,
-			    vmm->hit_heap.num);
+vmm_done:
+			vmm->stats.sort_maxg = MAX(vmm->stats.sort_maxg,
+			    vmm->hit_sort.new.num);
+			vmm->stats.sort_maxl = MAX(vmm->stats.sort_maxl,
+			    vmm->hit_sort.new.num);
+			SORT_MERGE(vmm->hit_sort, cmp_hit);
 		}
 	}
 }
@@ -861,13 +923,13 @@ mon(void)
 	}
 
 	range(&mem_f, mem_pre, g_mem);
-	printf("MS/s=%8.2f/s  Mem=%5.1f%sB  MS-heap=%u/%u/%u\n",
+	printf("MS/s=%8.2f/s  Mem=%5.1f%sB  MS-sort=%u/%u/%u\n",
 	    g_evtcnt_rate / (t - t_prev),
 	    mem_f, mem_pre,
 	    (unsigned)g_ms_maxl,
 	    (unsigned)g_ms_maxg,
-	    (unsigned)g_ms.capacity);
-	printf("FC VM HT                     HT-buf        MS+hit-buf             Hit-heap                  MS\n");
+	    (unsigned)g_ms.sorted.capacity);
+	printf("FC VM HT                     HT-buf        MS+hit-buf             Hit-sort                  MS\n");
 	g_ms_maxl = 0;
 	for (fec_i = 0; fec_i < g_fec_num; ++fec_i) {
 		struct Fec *fec = fec_get(fec_i);
@@ -891,14 +953,14 @@ mon(void)
 			    (unsigned)vmm->stats.ch_maxl,
 			    (unsigned)vmm->stats.ch_maxg,
 			    (unsigned)vmm->ch_buf.capacity,
-			    (unsigned)vmm->stats.heap_maxl,
-			    (unsigned)vmm->stats.heap_maxg,
-			    (unsigned)vmm->hit_heap.capacity,
+			    (unsigned)vmm->stats.sort_maxl,
+			    (unsigned)vmm->stats.sort_maxg,
+			    (unsigned)vmm->hit_sort.sorted.capacity,
 			    vmm->stats.ms_num
 			    );
 			vmm->stats.ht_maxl = 0;
 			vmm->stats.ch_maxl = 0;
-			vmm->stats.heap_maxl = 0;
+			vmm->stats.sort_maxl = 0;
 		}
 	}
 
@@ -906,33 +968,9 @@ mon(void)
 	t_prev = t;
 }
 
-void
-sort(void)
-{
-	size_t old_i, new_i, dst_i;
-
-	/* Sort new data. */
-	qsort(&g_ms_new.arr[0], g_ms_new.num, sizeof *g_ms_new.arr, cmp_ms);
-
-	/* Merge new into old. */
-	old_i = g_ms.tail;
-	new_i = g_ms_new.num;
-	dst_i = old_i + new_i;
-	while (new_i) {
-		--dst_i;
-		g_ms.arr[dst_i] = (!old_i ||
-		    cmp_ms(&g_ms_new.arr[new_i - 1], &g_ms.arr[old_i - 1]) >
-		    0)
-		    ? g_ms_new.arr[--new_i]
-		    : g_ms.arr[--old_i];
-	}
-	g_ms.tail += g_ms_new.num;
-	g_ms_new.num = 0;
-	g_ms_maxg = MAX(g_ms_maxg, g_ms.tail);
-	g_ms_maxl = MAX(g_ms_maxl, g_ms.tail);
-}
-
-/* Drasi stuff. */
+/*
+ * Drasi stuff.
+ */
 
 void loop(lwroc_pipe_buffer_consumer *, const lwroc_thread_block *,
     lwroc_data_pipe_handle *, volatile int *);
@@ -944,12 +982,10 @@ lwroc_user_filter_pre_setup_functions(void)
 	_lwroc_user_filter_functions->loop = loop;
 	_lwroc_user_filter_functions->max_ev_len = max_ev_len;
 	_lwroc_user_filter_functions->name = "filter_vmm";
-	g_ms.capacity = 1 << 24;
-	g_ms.arr = calloc(g_ms.capacity, sizeof *g_ms.arr);
-	g_mem += g_ms.capacity * sizeof *g_ms.arr;
-	g_ms_new.capacity = 1 << 16;
-	g_ms_new.arr = calloc(g_ms_new.capacity, sizeof *g_ms_new.arr);
-	g_mem += g_ms_new.capacity * sizeof *g_ms_new.arr;
+	SORT_INIT(g_ms, 1 << 24, 1 << 17, fail);
+	return;
+fail:
+	LWROC_FATAL("MS array init failed!");
 }
 
 void
@@ -1100,21 +1136,23 @@ loop(lwroc_pipe_buffer_consumer *pipe_buf, const lwroc_thread_block
 			}
 		}
 
-		/* Transform ms/hits to HT and populate heaps. */
-		raw2heap();
+		/* Transform MS/hits to HT and populate part-sorted lists. */
+		raw2ht();
 
 		/* Move any remaining data to the pre-buf space. */
 		buf_bytes -= i;
 		memmove(buf, buf + i, buf_bytes);
 
 		/* Sort hits. */
-		sort();
+		SORT_MERGE(g_ms, cmp_ms);
+		g_ms_maxg = MAX(g_ms_maxg, g_ms.sorted.tail);
+		g_ms_maxl = MAX(g_ms_maxl, g_ms.sorted.tail);
 
 		/* Look for ROI's. */
 		roi(pipe_buf, data_handle);
 
 		/* Compact sorted lists. */
-		compact();
+		SORT_COMPACT(g_ms);
 
 		mon();
 
