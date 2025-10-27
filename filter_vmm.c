@@ -47,12 +47,21 @@ struct HtMs {
 	uint32_t	ts;
 	uint64_t	ht;
 };
-HEAP_HEAD(HeapMs, HtMs);
-static struct HeapMs g_ms_heap;
+static struct {
+	size_t	capacity;
+	size_t	head;
+	size_t	tail;
+	struct	HtMs *arr;
+} g_ms;
 /* "Global", total. */
-static size_t	g_ms_heap_maxg;
+static size_t	g_ms_maxg;
 /* "Local", since last time. */
-static size_t	g_ms_heap_maxl;
+static size_t	g_ms_maxl;
+static struct {
+	size_t	capacity;
+	size_t	num;
+	struct	HtMs *arr;
+} g_ms_new;
 
 struct HtHit {
 	uint16_t	ch;
@@ -61,11 +70,13 @@ struct HtHit {
 };
 HEAP_HEAD(HeapHit, HtHit);
 
+static void compact(void);
 static void process_hit(uint32_t, uint16_t);
 static void process_marker(uint32_t, uint16_t);
 static void range(float *, char *, uint64_t);
 static void raw2heap(void);
 static void roi(lwroc_pipe_buffer_consumer *, lwroc_data_pipe_handle *);
+static void sort(void);
 
 #define TS2NS 22.5 /* (5.24288 / 0.233045) */
 
@@ -255,15 +266,29 @@ is_ms_ch2(unsigned a_vmm_i, unsigned a_ch_i)
 }
 
 int
-cmp_ms(struct HtMs const *a_l, struct HtMs const *a_r)
+cmp_ms(void const *a_l, void const *a_r)
 {
-	return a_l->ht < a_r->ht;
+	struct HtMs const *l = a_l;
+	struct HtMs const *r = a_r;
+
+	return 1 - 2 * (l->ht < r->ht);
 }
 
 int
 cmp_hit(struct HtHit const *a_l, struct HtHit const *a_r)
 {
 	return a_l->ht < a_r->ht;
+}
+
+void
+compact(void)
+{
+	size_t num;
+
+	num = g_ms.tail - g_ms.head;
+	memmove(&g_ms.arr[0], &g_ms.arr[g_ms.head], num * sizeof *g_ms.arr);
+	g_ms.head = 0;
+	g_ms.tail = num;
 }
 
 struct Fec *
@@ -307,15 +332,15 @@ vmm_get(struct Fec *a_fec, unsigned a_i)
 		free(a_fec->vmm_arr);
 		g_mem -= a_fec->vmm_num * sizeof *arr;
 		for (i = a_fec->vmm_num; i < num; ++i) {
-			HEAP_INIT(arr[i].hit_heap, cmp_hit, 1 << 17, fail);
-			g_mem += (1 << 17) * sizeof *arr[i].hit_heap.arr;
+			HEAP_INIT(arr[i].hit_heap, cmp_hit, 1 << 18, fail);
+			g_mem += (1 << 18) * sizeof *arr[i].hit_heap.arr;
 		}
 		a_fec->vmm_arr = arr;
 		a_fec->vmm_num = num;
 	}
 	vmm = &a_fec->vmm_arr[a_i];
 	if (!vmm->ht_buf.arr) {
-		CIRC_INIT(vmm->ht_buf, 256);
+		CIRC_INIT(vmm->ht_buf, 1 << 10);
 		CIRC_INIT(vmm->ch_buf, 1 << 17);
 	}
 	return vmm;
@@ -526,8 +551,8 @@ roi(lwroc_pipe_buffer_consumer *pipe_buf, lwroc_data_pipe_handle *data_handle)
 	}
 
 	/* Find as many ROI's as possible in current data. */
-	while (g_ms_heap.num) {
-		struct HtMs *msp;
+	while (g_ms.head < g_ms.tail) {
+		struct HtMs ms;
 		uint64_t ht0;
 
 		void *p0;
@@ -542,8 +567,8 @@ roi(lwroc_pipe_buffer_consumer *pipe_buf, lwroc_data_pipe_handle *data_handle)
 		uint32_t id;
 
 		/* Peek at 1st MS and see what to do. */
-		msp = &g_ms_heap.arr[0];
-		ht0 = msp->ht;
+		ms = g_ms.arr[g_ms.head];
+		ht0 = ms.ht;
 		if (ht_last_max - ht0 < HT_DT_TOO_MUCH_HT) {
 			/* We don't have a crapload of data. */
 			if (ht_last_min - ht0 < HT_DT_TOO_LITTLE_HT) {
@@ -554,12 +579,10 @@ roi(lwroc_pipe_buffer_consumer *pipe_buf, lwroc_data_pipe_handle *data_handle)
 
 		memset(vmm_arr, 0, sizeof vmm_arr);
 
-		while (g_ms_heap.num) {
-			struct HtMs ms;
+		while (g_ms.head < g_ms.tail) {
 			uint64_t dht;
 
 			/* Put MS in table. */
-			HEAP_EXTRACT(g_ms_heap, ms, fail);
 			if (ms.ht < g_ht_prev) {
 				LWROC_ERROR_FMT("%2u:%2u: Master starts "
 				    "out of order! (%08x%08x -> %08x%08x).",
@@ -574,14 +597,17 @@ roi(lwroc_pipe_buffer_consumer *pipe_buf, lwroc_data_pipe_handle *data_handle)
 				    ms.id >> 4, ms.id & 0xf,
 				    (unsigned)vmm_arr[ms.id].num);
 			} else {
+				struct HtMs *msp;
+
 				msp = &vmm_arr[ms.id].ms[vmm_arr[ms.id].num];
 				memcpy(msp, &ms, sizeof ms);
 			}
+			++g_ms.head;
 			++vmm_arr[ms.id].num;
 
 			/* Check if next MS is within window. */
-			msp = &g_ms_heap.arr[0];
-			dht = msp->ht - ht0;
+			ms = g_ms.arr[g_ms.head];
+			dht = ms.ht - ht0;
 			if (dht > MS_WINDOW_HT) {
 				break;
 			}
@@ -780,26 +806,34 @@ find_ht_span:
 				    + ht0->ht;
 				vmm->ht_latest = MAX(vmm->ht_latest, ht);
 				if (is_ms_ch1(vmm_i, ch->ch)) {
-					struct HtMs ms;
+					if (g_ms_new.num < g_ms_new.capacity)
+					{
+						struct HtMs ms;
 
-					ms.id = fec_i << 4 | vmm_i;
-					ms.ts = ts;
-					ms.ht = ht;
-					HEAP_INSERT(g_ms_heap, ms, fail);
+						ms.id = fec_i << 4 | vmm_i;
+						ms.ts = ts;
+						ms.ht = ht;
+						g_ms_new.arr[g_ms_new.num++] =
+						    ms;
+					} else {
+						LWROC_ERROR_FMT(
+						    "%2u:%2u: MS overflow!",
+						    fec_i, vmm_i);
+					}
 				} else {
 					struct HtHit hit;
 
 					hit.ch = ch->ch;
 					hit.ht = ht;
 					hit.adc_tdc = ch->adc_tdc;
-					HEAP_INSERT(vmm->hit_heap, hit, fail);
+					if(0)HEAP_INSERT(vmm->hit_heap, hit, fail);
 				}
 				CIRC_DROP(vmm->ch_buf);
 				continue;
 fail:
 				LWROC_ERROR_FMT(
-				    "%2u:%2u: Heap overflow, "
-				    "Heimtime missing?", fec_i, vmm_i);
+				    "%2u:%2u: Hit heap overflow!",
+				    fec_i, vmm_i);
 				CIRC_DROP(vmm->ch_buf);
 			}
 			vmm->stats.heap_maxg = MAX(vmm->stats.heap_maxg,
@@ -808,8 +842,6 @@ fail:
 			    vmm->hit_heap.num);
 		}
 	}
-	g_ms_heap_maxg = MAX(g_ms_heap_maxg, g_ms_heap.num);
-	g_ms_heap_maxl = MAX(g_ms_heap_maxl, g_ms_heap.num);
 }
 
 void
@@ -832,11 +864,11 @@ mon(void)
 	printf("MS/s=%8.2f/s  Mem=%5.1f%sB  MS-heap=%u/%u/%u\n",
 	    g_evtcnt_rate / (t - t_prev),
 	    mem_f, mem_pre,
-	    (unsigned)g_ms_heap_maxl,
-	    (unsigned)g_ms_heap_maxg,
-	    (unsigned)g_ms_heap.capacity);
+	    (unsigned)g_ms_maxl,
+	    (unsigned)g_ms_maxg,
+	    (unsigned)g_ms.capacity);
 	printf("FC VM HT                     HT-buf        MS+hit-buf             Hit-heap                  MS\n");
-	g_ms_heap_maxl = 0;
+	g_ms_maxl = 0;
 	for (fec_i = 0; fec_i < g_fec_num; ++fec_i) {
 		struct Fec *fec = fec_get(fec_i);
 
@@ -874,6 +906,32 @@ mon(void)
 	t_prev = t;
 }
 
+void
+sort(void)
+{
+	size_t old_i, new_i, dst_i;
+
+	/* Sort new data. */
+	qsort(&g_ms_new.arr[0], g_ms_new.num, sizeof *g_ms_new.arr, cmp_ms);
+
+	/* Merge new into old. */
+	old_i = g_ms.tail;
+	new_i = g_ms_new.num;
+	dst_i = old_i + new_i;
+	while (new_i) {
+		--dst_i;
+		g_ms.arr[dst_i] = (!old_i ||
+		    cmp_ms(&g_ms_new.arr[new_i - 1], &g_ms.arr[old_i - 1]) >
+		    0)
+		    ? g_ms_new.arr[--new_i]
+		    : g_ms.arr[--old_i];
+	}
+	g_ms.tail += g_ms_new.num;
+	g_ms_new.num = 0;
+	g_ms_maxg = MAX(g_ms_maxg, g_ms.tail);
+	g_ms_maxl = MAX(g_ms_maxl, g_ms.tail);
+}
+
 /* Drasi stuff. */
 
 void loop(lwroc_pipe_buffer_consumer *, const lwroc_thread_block *,
@@ -886,11 +944,12 @@ lwroc_user_filter_pre_setup_functions(void)
 	_lwroc_user_filter_functions->loop = loop;
 	_lwroc_user_filter_functions->max_ev_len = max_ev_len;
 	_lwroc_user_filter_functions->name = "filter_vmm";
-	HEAP_INIT(g_ms_heap, cmp_ms, 1 << 24, fail);
-	g_mem += (1 << 24) * sizeof *g_ms_heap.arr;
-	return;
-fail:
-	err(EXIT_FAILURE, "MS heap init failed");
+	g_ms.capacity = 1 << 24;
+	g_ms.arr = calloc(g_ms.capacity, sizeof *g_ms.arr);
+	g_mem += g_ms.capacity * sizeof *g_ms.arr;
+	g_ms_new.capacity = 1 << 16;
+	g_ms_new.arr = calloc(g_ms_new.capacity, sizeof *g_ms_new.arr);
+	g_mem += g_ms_new.capacity * sizeof *g_ms_new.arr;
 }
 
 void
@@ -1044,12 +1103,18 @@ loop(lwroc_pipe_buffer_consumer *pipe_buf, const lwroc_thread_block
 		/* Transform ms/hits to HT and populate heaps. */
 		raw2heap();
 
-		/* Look for ROI's. */
-		roi(pipe_buf, data_handle);
-
 		/* Move any remaining data to the pre-buf space. */
 		buf_bytes -= i;
 		memmove(buf, buf + i, buf_bytes);
+
+		/* Sort hits. */
+		sort();
+
+		/* Look for ROI's. */
+		roi(pipe_buf, data_handle);
+
+		/* Compact sorted lists. */
+		compact();
 
 		mon();
 
