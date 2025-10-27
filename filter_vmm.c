@@ -330,7 +330,7 @@ process_ht(unsigned a_vmm_i, unsigned a_ch_i, uint32_t a_ts_curr)
 	struct Vmm *vmm = vmm_get(fec, a_vmm_i);
 	struct HtPair *pair;
 	uint32_t dts;
-	int do_bit = 0, do_clear = 0, do_inc = 0;
+	int do_bit = 0, do_clear = 0;
 
 #define HT_P (5.24288 * 1e6 / (TS2NS * HT_SCALE))
 #define HT_0 (0.16384 * 1e6 / (TS2NS * HT_SCALE))
@@ -340,7 +340,7 @@ process_ht(unsigned a_vmm_i, unsigned a_ch_i, uint32_t a_ts_curr)
 	dts = a_ts_curr - vmm->ht_build.ts_prev;
 	vmm->ht_build.ts_prev = a_ts_curr;
 
-if(0)if(1==a_vmm_i)printf("HTP %2u %2u %2u  %08x  %10.3f.\n",
+if(0)printf("HTP %2u %2u %2u  %08x  %10.3f.\n",
 	g_fec_i, a_vmm_i, a_ch_i,
 	dts,
 	1e-6 * TS2NS * HT_SCALE * dts);
@@ -350,15 +350,12 @@ if(0)if(1==a_vmm_i)printf("HTP %2u %2u %2u  %08x  %10.3f.\n",
 		if (!HT_APPROX(dts, HT_P)) {
 			return;
 		}
-		if (0) LWROC_INFO_FMT("%2u:%2u: Found HT carry.",
-		    g_fec_i, a_vmm_i);
 		vmm->ht_build.has_carry = 1;
 		++vmm->stats.ht_carry;
 		do_clear = 1;
 	}
 
 	if (HT_APPROX(dts, HT_P)) {
-		do_inc = 1;
 		do_clear = 1;
 	}
 #define TEST_BIT(bit) \
@@ -372,27 +369,12 @@ if(0)if(1==a_vmm_i)printf("HTP %2u %2u %2u  %08x  %10.3f.\n",
 	    !HT_APPROX(dts, 2*HT_0) &&
 	    !HT_APPROX(dts, HT_1) &&
 	    !HT_APPROX(dts, 2*HT_1)) {
-		if (0) LWROC_ERROR_FMT("%2u:%2u: Lost HT carry signal.",
-		    g_fec_i, a_vmm_i);
 		vmm->ht_build.has_carry = 0;
 		return;
 	}
 	if (do_bit) {
 		vmm->ht_build.mask |= (do_bit - 1) << vmm->ht_build.bit_i;
 		++vmm->ht_build.bit_i;
-		do_inc = 1;
-	}
-
-	/* Create a timestamp for every 1<<19 pulse. */
-	if (0) if (vmm->ht_build.ht.has && do_inc) {
-		vmm->ht_build.ht.ht += do_inc << 19;
-		/*
-		 * Don't complain about lost HT's, will happen when no
-		 * MS coming in.
-		 */
-		CIRC_PUSH(pair, "Heimtime", vmm->ht_buf, 0);
-		pair->ht = vmm->ht_build.ht.ht;
-		pair->ts = a_ts_curr;
 	}
 
 	if (32 == vmm->ht_build.bit_i) {
@@ -402,12 +384,6 @@ if(0)if(1==a_vmm_i)printf("HTP %2u %2u %2u  %08x  %10.3f.\n",
 		++vmm->stats.ht_num;
 		if (vmm->ht_build.ht.has) {
 			if (vmm->ht_build.ht.ht + 1*(4 << 24) != ht) {
-				if (0) LWROC_ERROR_FMT(
-				    "%2u:%2u: Heimtime expected=%08x%08x "
-				    "but got=%08x%08x!",
-				    g_fec_i, a_vmm_i,
-				    PF_TS(vmm->ht_build.ht.ht),
-				    PF_TS(ht));
 				++vmm->stats.ht_lost;
 			} else if (vmm->ht_build.ht.ht > ht) {
 				LWROC_ERROR_FMT(
@@ -424,15 +400,9 @@ if(0)if(1==a_vmm_i)printf("HTP %2u %2u %2u  %08x  %10.3f.\n",
 		do_clear = 1;
 		vmm->ht_build.ht.has = 1;
 		vmm->ht_build.ht.ht = ht;
-		if (0)
-			LWROC_INFO_FMT("%2u:%2u: HT = %08x.",
-			    g_fec_i, a_vmm_i,
-			    (uint32_t)vmm->ht_build.mask);
-		if (1) {
-			CIRC_PUSH(pair, "Heimtime", vmm->ht_buf, 0);
-			pair->ht = vmm->ht_build.ht.ht;
-			pair->ts = a_ts_curr;
-		}
+		CIRC_PUSH(pair, "Heimtime", vmm->ht_buf, 0);
+		pair->ht = vmm->ht_build.ht.ht;
+		pair->ts = a_ts_curr;
 	}
 	if (do_clear) {
 		vmm->ht_build.bit_i = 0;
@@ -804,32 +774,10 @@ find_ht_span:
 					CIRC_DROP(vmm->ht_buf);
 					goto find_ht_span;
 				}
-				ht = (double)(ts - ht0->ts)
-				    * (double)(ht1->ht - ht0->ht)
-				    / (double)(ht1->ts - ht0->ts)
-				    + (double)ht0->ht;
-if(0 && 1 == vmm_i) {
-static uint32_t ts_p[20];
-static uint64_t ht_p[20];
-if(ts-ts_p[vmm_i]>100){
-printf("Int %2u %2u %10u %10u %10u %10u %20llu %20llu %7d %7d %7d %08x%08x %d\n",
-    fec_i,
-    vmm_i,
-    ts,
-    ts-ts_p[vmm_i],
-    ht0->ts,
-    ht1->ts,
-    (unsigned long long)ht0->ht,
-    (unsigned long long)ht1->ht,
-    (int)(ts - ht0->ts),
-    (int)(ht1->ht - ht0->ht),
-    (int)(ht1->ts - ht0->ts),
-    PF_TS(ht),
-    (int)(ht - ht_p[vmm_i]));
-ts_p[vmm_i] = ts;
-ht_p[vmm_i] = ht;
-}
-}
+				ht = (ts - ht0->ts)
+				    * (ht1->ht - ht0->ht)
+				    / (ht1->ts - ht0->ts)
+				    + ht0->ht;
 				vmm->ht_latest = MAX(vmm->ht_latest, ht);
 				if (is_ms_ch1(vmm_i, ch->ch)) {
 					struct HtMs ms;
@@ -837,19 +785,6 @@ ht_p[vmm_i] = ht;
 					ms.id = fec_i << 4 | vmm_i;
 					ms.ts = ts;
 					ms.ht = ht;
-if(0 && 1 == vmm_i){
-static uint32_t tsp[20];
-static uint64_t htp[20];
-printf("MS %2u %2u %10u %10d %20llu %10d\n",
-    fec_i,
-    vmm_i,
-    ts,
-    ts - tsp[vmm_i],
-    (unsigned long long)ht,
-    (int)(ht - htp[vmm_i]));
-tsp[vmm_i] = ts;
-htp[vmm_i] = ht;
-}
 					HEAP_INSERT(g_ms_heap, ms, fail);
 				} else {
 					struct HtHit hit;
@@ -867,14 +802,14 @@ fail:
 				    "Heimtime missing?", fec_i, vmm_i);
 				CIRC_DROP(vmm->ch_buf);
 			}
-			g_ms_heap_maxg = MAX(g_ms_heap_maxg, g_ms_heap.num);
-			g_ms_heap_maxl = MAX(g_ms_heap_maxl, g_ms_heap.num);
 			vmm->stats.heap_maxg = MAX(vmm->stats.heap_maxg,
 			    vmm->hit_heap.num);
 			vmm->stats.heap_maxl = MAX(vmm->stats.heap_maxl,
 			    vmm->hit_heap.num);
 		}
 	}
+	g_ms_heap_maxg = MAX(g_ms_heap_maxg, g_ms_heap.num);
+	g_ms_heap_maxl = MAX(g_ms_heap_maxl, g_ms_heap.num);
 }
 
 void
