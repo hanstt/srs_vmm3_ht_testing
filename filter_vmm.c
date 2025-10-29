@@ -71,11 +71,14 @@
 	struct	Type *arr; \
 }
 #define CIRC_GETNUM(circ) ((circ.wr_i - circ.rd_i) % circ.capacity)
-#define CIRC_INIT(circ, N) do { \
+#define CIRC_INIT(circ, N, fail) do { \
 	circ.capacity = N; \
 	circ.rd_i = 0; \
 	circ.wr_i = 0; \
 	circ.arr = calloc(N, sizeof *circ.arr); \
+	if (!circ.arr) { \
+		goto fail; \
+	} \
 	g_mem += (N) * sizeof *circ.arr; \
 } while (0)
 #define CIRC_STEP(circ, idx, ofs) ((circ.idx + ofs) & (circ.capacity - 1))
@@ -391,19 +394,19 @@ vmm_get(struct Fec *a_fec, unsigned a_i)
 		free(a_fec->vmm_arr);
 		g_mem -= a_fec->vmm_num * sizeof *arr;
 		for (i = a_fec->vmm_num; i < num; ++i) {
-			SORT_INIT(arr[i].hit_sort, 1 << 18, 1 << 12, fail);
+			SORT_INIT(arr[i].hit_sort, 1 << 17, 1 << 12, fail);
 		}
 		a_fec->vmm_arr = arr;
 		a_fec->vmm_num = num;
 	}
 	vmm = &a_fec->vmm_arr[a_i];
 	if (!vmm->ht_buf.arr) {
-		CIRC_INIT(vmm->ht_buf, 1 << 10);
-		CIRC_INIT(vmm->ch_buf, 1 << 17);
+		CIRC_INIT(vmm->ht_buf, 1 << 8, fail);
+		CIRC_INIT(vmm->ch_buf, 1 << 17, fail);
 	}
 	return vmm;
 fail:
-	LWROC_FATAL("Hit array init failed!");
+	LWROC_FATAL("VMM init failed!");
 }
 
 void
@@ -605,6 +608,11 @@ roi(lwroc_pipe_buffer_consumer *pipe_buf, lwroc_data_pipe_handle *data_handle)
 				ht_last_min = MIN(ht_last_min,
 				    vmm->ht_latest);
 			}
+			SORT_MERGE(vmm->hit_sort, cmp_hit);
+			vmm->stats.sort_maxg = MAX(vmm->stats.sort_maxg,
+			    vmm->hit_sort.sorted.tail);
+			vmm->stats.sort_maxl = MAX(vmm->stats.sort_maxl,
+			    vmm->hit_sort.sorted.tail);
 		}
 	}
 
@@ -700,19 +708,22 @@ uint64_t ht1 = ht0 + 18196e3 + 5530 - 530010;
 
 		p_sc = p32++;
 
-		/* For each VMM with the MS, extract hits in ROI. */
+		/* Write ref time. */
+		*p32++ = (uint32_t)(ht0 >> 32);
+		*p32++ = (uint32_t)ht0;
+
+		/* For each VMM with MS sync-check, extract hits in ROI. */
 		for (id = 0; id < LENGTH(vmm_arr); ++id) {
 			struct Fec *fec;
 			struct Vmm *vmm;
 			uint32_t *p_hit_n;
-			uint32_t ms_n, hit_n;
-			unsigned i;
+			uint64_t ht;
+			uint32_t hit_n;
 
 			if (2 != vmm_arr[id].num) {
 				continue;
 			}
-
-			if (2 == vmm_arr[id].num && !sync_check) {
+			if (!sync_check) {
 				sync_check =
 				    vmm_arr[id].ms[1].ts -
 				    vmm_arr[id].ms[0].ts;
@@ -720,16 +731,11 @@ uint64_t ht1 = ht0 + 18196e3 + 5530 - 530010;
 
 			p_hit_n = p32++;
 
-			/* Write MS. */
-			ms_n = 0;
-			for (i = 0; i < MIN(vmm_arr[id].num, 2); ++i) {
-				uint64_t ht;
-
-				ht = vmm_arr[id].ms[i].ht;
-				*p32++ = (uint32_t)(ht >> 32);
-				*p32++ = (uint32_t)ht;
-				++ms_n;
-			}
+			/* Write time-diff + sync-check. */
+			ht = vmm_arr[id].ms[0].ht;
+			*p32++ =
+			    (vmm_arr[id].ms[0].ht - ht0) << 16 |
+			    (vmm_arr[id].ms[1].ht - ht);
 
 			fec_i = id >> 4;
 			vmm_i = id & 0xf;
@@ -744,13 +750,13 @@ uint64_t ht1 = ht0 + 18196e3 + 5530 - 530010;
 
 				hit = SORT_FIRST(vmm->hit_sort);
 				if (ht0 + ROI_RIGHT_HT < hit.ht) {
-					/* Next hit outside ROI. */
+					/* Next hit after ROI. */
 					break;
 				}
 				if (ht0 + ROI_LEFT_HT < hit.ht) {
 					uint32_t dht;
 
-					/* Write hit. */
+					/* Hit inside ROI, write it. */
 					dht = 0x00ffffff &
 					    (hit.ht - ht0 + (1 << 23));
 					*p32++ = hit.ch << 24 | dht;
@@ -759,7 +765,7 @@ uint64_t ht1 = ht0 + 18196e3 + 5530 - 530010;
 				}
 				SORT_NEXT(vmm->hit_sort);
 			}
-			*p_hit_n = id << 20 | ms_n << 16 | hit_n;
+			*p_hit_n = id << 16 | hit_n;
 			++vmm->stats.ms_num;
 		}
 
@@ -843,7 +849,7 @@ raw2ht(void)
 find_ht_span:
 			if (CIRC_GETNUM(vmm->ht_buf) < 2) {
 				/* We need at least 2 HT's to interpolate. */
-				goto vmm_done;
+				continue;
 			}
 			CIRC_PEEK(ht0, vmm->ht_buf, 0);
 			CIRC_PEEK(ht1, vmm->ht_buf, 1);
@@ -896,12 +902,6 @@ hit_fail:
 				LWROC_ERROR_FMT("%2u:%2u: Hit overflow!",
 				    fec_i, vmm_i);
 			}
-vmm_done:
-			vmm->stats.sort_maxg = MAX(vmm->stats.sort_maxg,
-			    vmm->hit_sort.new.num);
-			vmm->stats.sort_maxl = MAX(vmm->stats.sort_maxl,
-			    vmm->hit_sort.new.num);
-			SORT_MERGE(vmm->hit_sort, cmp_hit);
 		}
 	}
 }
@@ -995,7 +995,7 @@ loop(lwroc_pipe_buffer_consumer *pipe_buf, const lwroc_thread_block
 {
 	char buf[1 << 16];
 	size_t buf_bytes = 0;
-	int frame_had = 0;
+	int frame_had[16] = {};
 	uint32_t frame_prev[16];
 	int is_sync = 0;
 
@@ -1091,8 +1091,8 @@ loop(lwroc_pipe_buffer_consumer *pipe_buf, const lwroc_thread_block
 				 */
 				g_fec_i = (id & 0xff) >> 4;
 				frame = BUF_R32(0 * sizeof(uint32_t));
-				if (frame_had && frame_prev[g_fec_i] + 1 !=
-				    frame) {
+				if (frame_had[g_fec_i] &&
+				    frame_prev[g_fec_i] + 1 != frame) {
 					LWROC_ERROR_FMT("FEC=%u "
 					    "frame counter mismatch "
 					    "(prev=0x%08x, curr=0x%08x)!",
@@ -1101,7 +1101,7 @@ loop(lwroc_pipe_buffer_consumer *pipe_buf, const lwroc_thread_block
 				}
 				/* ts = BUF_R32(2 * sizeof(uint32_t)). */
 				/* of = BUF_R32(3 * sizeof(uint32_t)). */
-				frame_had = 1;
+				frame_had[g_fec_i] = 1;
 				frame_prev[g_fec_i] = frame;
 
 				if (!is_sync) {
