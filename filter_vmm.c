@@ -201,10 +201,13 @@ struct HtMs {
 	uint64_t	ht;
 };
 SORT_DECL(HtMs) g_ms;
-/* "Global", total. */
-static size_t	g_ms_maxg;
+/* "Global", total of new MS. */
+static size_t	g_ms_new_maxg;
 /* "Local", since last time. */
-static size_t	g_ms_maxl;
+static size_t	g_ms_new_maxl;
+/* Same for the sorted MS. */
+static size_t	g_ms_sorted_maxg;
+static size_t	g_ms_sorted_maxl;
 
 struct HtHit {
 	uint16_t	ch;
@@ -263,8 +266,10 @@ struct Vmm {
 		size_t	ht_maxl;
 		size_t	ch_maxg;
 		size_t	ch_maxl;
-		size_t	sort_maxg;
-		size_t	sort_maxl;
+		size_t	hit_new_maxg;
+		size_t	hit_new_maxl;
+		size_t	hit_sorted_maxg;
+		size_t	hit_sorted_maxl;
 		unsigned	ms_num;
 	} stats;
 };
@@ -394,7 +399,7 @@ vmm_get(struct Fec *a_fec, unsigned a_i)
 		free(a_fec->vmm_arr);
 		g_mem -= a_fec->vmm_num * sizeof *arr;
 		for (i = a_fec->vmm_num; i < num; ++i) {
-			SORT_INIT(arr[i].hit_sort, 1 << 17, 1 << 12, fail);
+			SORT_INIT(arr[i].hit_sort, 1 << 17, 1 << 14, fail);
 		}
 		a_fec->vmm_arr = arr;
 		a_fec->vmm_num = num;
@@ -472,8 +477,8 @@ if(0)printf("HTP %2u %2u %2u  %08x  %10.3f.\n",
 			if (vmm->ht_build.ht.ht + 1*(4 << 24) != ht) {
 				++vmm->stats.ht_lost;
 			} else if (vmm->ht_build.ht.ht > ht) {
-				LWROC_ERROR_FMT(
-				    "%2u:%2u: Heimtime reversed %08x -> %08x!",
+				LWROC_ERROR_FMT("%2u:%2u: "
+				    "Heimtime reversed %08x -> %08x!",
 				    g_fec_i, a_vmm_i,
 				    (uint32_t)(vmm->ht_build.ht.ht >> 24),
 				    vmm->ht_build.mask);
@@ -608,11 +613,17 @@ roi(lwroc_pipe_buffer_consumer *pipe_buf, lwroc_data_pipe_handle *data_handle)
 				ht_last_min = MIN(ht_last_min,
 				    vmm->ht_latest);
 			}
+			vmm->stats.hit_new_maxg = MAX(vmm->stats.hit_new_maxg,
+			    vmm->hit_sort.new.num);
+			vmm->stats.hit_new_maxl = MAX(vmm->stats.hit_new_maxl,
+			    vmm->hit_sort.new.num);
 			SORT_MERGE(vmm->hit_sort, cmp_hit);
-			vmm->stats.sort_maxg = MAX(vmm->stats.sort_maxg,
-			    vmm->hit_sort.sorted.tail);
-			vmm->stats.sort_maxl = MAX(vmm->stats.sort_maxl,
-			    vmm->hit_sort.sorted.tail);
+			vmm->stats.hit_sorted_maxg =
+			    MAX(vmm->stats.hit_sorted_maxg,
+				vmm->hit_sort.sorted.tail);
+			vmm->stats.hit_sorted_maxl =
+			    MAX(vmm->stats.hit_sorted_maxl,
+				vmm->hit_sort.sorted.tail);
 		}
 	}
 
@@ -895,11 +906,13 @@ find_ht_span:
 				}
 				continue;
 ms_fail:
-				LWROC_ERROR_FMT("%2u:%2u: MS overflow!",
+				LWROC_ERROR_FMT("%2u:%2u: "
+				    "Global MS sorted-buffer overflow!",
 				    fec_i, vmm_i);
 				continue;
 hit_fail:
-				LWROC_ERROR_FMT("%2u:%2u: Hit overflow!",
+				LWROC_ERROR_FMT("%2u:%2u: "
+				    "Per-VMM hit sorted-buffer overflow!",
 				    fec_i, vmm_i);
 			}
 		}
@@ -923,14 +936,18 @@ mon(void)
 	}
 
 	range(&mem_f, mem_pre, g_mem);
-	printf("MS/s=%8.2f/s  Mem=%5.1f%sB  MS-sort=%u/%u/%u\n",
+	printf("MS/s=%8.2f/s  Mem=%5.1f%sB  MS-sort=(%u/%u/%u,%u/%u/%u)\n",
 	    g_evtcnt_rate / (t - t_prev),
 	    mem_f, mem_pre,
-	    (unsigned)g_ms_maxl,
-	    (unsigned)g_ms_maxg,
+	    (unsigned)g_ms_new_maxl,
+	    (unsigned)g_ms_new_maxg,
+	    (unsigned)g_ms.new.capacity,
+	    (unsigned)g_ms_sorted_maxl,
+	    (unsigned)g_ms_sorted_maxg,
 	    (unsigned)g_ms.sorted.capacity);
-	printf("FC VM HT                     HT-buf        MS+hit-buf             Hit-sort                  MS\n");
-	g_ms_maxl = 0;
+	printf("FC VM (          HT        ) (   HT-buf  ) (     MS+hit-buf     ) (       Hit-new      ,     Hit-sorted     )         MS\n");
+	g_ms_new_maxl = 0;
+	g_ms_sorted_maxl = 0;
 	for (fec_i = 0; fec_i < g_fec_num; ++fec_i) {
 		struct Fec *fec = fec_get(fec_i);
 
@@ -941,7 +958,8 @@ mon(void)
 			    " (%6u/%6u/%6u)"
 			    " (%3u/%3u/%3u)"
 			    " (%6u/%6u/%6u)"
-			    " (%6u/%6u/%6u) %10u\n",
+			    " (%6u/%6u/%6u,%6u/%6u/%6u)"
+			    " %10u\n",
 			    (unsigned)fec_i,
 			    (unsigned)vmm_i,
 			    vmm->stats.ht_num,
@@ -953,14 +971,18 @@ mon(void)
 			    (unsigned)vmm->stats.ch_maxl,
 			    (unsigned)vmm->stats.ch_maxg,
 			    (unsigned)vmm->ch_buf.capacity,
-			    (unsigned)vmm->stats.sort_maxl,
-			    (unsigned)vmm->stats.sort_maxg,
+			    (unsigned)vmm->stats.hit_new_maxl,
+			    (unsigned)vmm->stats.hit_new_maxg,
+			    (unsigned)vmm->hit_sort.new.capacity,
+			    (unsigned)vmm->stats.hit_sorted_maxl,
+			    (unsigned)vmm->stats.hit_sorted_maxg,
 			    (unsigned)vmm->hit_sort.sorted.capacity,
 			    vmm->stats.ms_num
 			    );
 			vmm->stats.ht_maxl = 0;
 			vmm->stats.ch_maxl = 0;
-			vmm->stats.sort_maxl = 0;
+			vmm->stats.hit_new_maxl = 0;
+			vmm->stats.hit_sorted_maxl = 0;
 		}
 	}
 
@@ -982,7 +1004,7 @@ lwroc_user_filter_pre_setup_functions(void)
 	_lwroc_user_filter_functions->loop = loop;
 	_lwroc_user_filter_functions->max_ev_len = max_ev_len;
 	_lwroc_user_filter_functions->name = "filter_vmm";
-	SORT_INIT(g_ms, 1 << 24, 1 << 17, fail);
+	SORT_INIT(g_ms, 1 << 24, 1 << 20, fail);
 	return;
 fail:
 	LWROC_FATAL("MS array init failed!");
@@ -1144,9 +1166,11 @@ loop(lwroc_pipe_buffer_consumer *pipe_buf, const lwroc_thread_block
 		memmove(buf, buf + i, buf_bytes);
 
 		/* Sort hits. */
+		g_ms_new_maxg = MAX(g_ms_new_maxg, g_ms.new.num);
+		g_ms_new_maxl = MAX(g_ms_new_maxl, g_ms.new.num);
 		SORT_MERGE(g_ms, cmp_ms);
-		g_ms_maxg = MAX(g_ms_maxg, g_ms.sorted.tail);
-		g_ms_maxl = MAX(g_ms_maxl, g_ms.sorted.tail);
+		g_ms_sorted_maxg = MAX(g_ms_sorted_maxg, g_ms.sorted.tail);
+		g_ms_sorted_maxl = MAX(g_ms_sorted_maxl, g_ms.sorted.tail);
 
 		/* Look for ROI's. */
 		roi(pipe_buf, data_handle);
